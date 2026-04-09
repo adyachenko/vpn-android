@@ -8,17 +8,27 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import com.sbcfg.manager.domain.ConfigManager
 import com.sbcfg.manager.integration.DeepLinkHandler
-import com.sbcfg.manager.integration.QrScannerActivity
 import com.sbcfg.manager.ui.navigation.NavGraph
 import com.sbcfg.manager.ui.theme.SbcfgTheme
 import com.sbcfg.manager.util.AppLog
 import com.sbcfg.manager.vpn.BoxService
 import com.sbcfg.manager.vpn.ServiceConnection
 import dagger.hilt.android.AndroidEntryPoint
+import javax.inject.Inject
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
+
+    @Inject
+    lateinit var configManager: ConfigManager
 
     /** Config JSON to pass to BoxService after VPN permission is granted */
     private var pendingConfigJson: String? = null
@@ -35,19 +45,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val qrScannerLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == RESULT_OK) {
-            val url = result.data?.getStringExtra(QrScannerActivity.RESULT_URL)
-            if (url != null) {
-                pendingDeepLinkUrl = url
-            }
-        }
-    }
-
     private var serviceConnection: ServiceConnection? = null
-    private var pendingDeepLinkUrl: String? = null
+    private val pendingDeepLinkUrl: MutableState<String?> = mutableStateOf(null)
 
     override fun onResume() {
         super.onResume()
@@ -66,20 +65,40 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             SbcfgTheme {
-                NavGraph(
-                    startDestination = "dashboard",
-                    onScanQr = { launchQrScanner() },
-                    deepLinkUrl = pendingDeepLinkUrl?.also { pendingDeepLinkUrl = null },
-                    onStartVpn = { configJson ->
-                        AppLog.i("Activity", "onStartVpn callback, configJson=${configJson?.length}")
-                        pendingConfigJson = configJson
-                        requestVpnPermission()
-                    },
-                    onStopVpn = {
-                        AppLog.i("Activity", "onStopVpn callback")
-                        BoxService.stop()
+                var startDestination by remember { mutableStateOf<String?>(null) }
+                LaunchedEffect(Unit) {
+                    val hasConfig = configManager.hasConfig()
+                    startDestination = when {
+                        pendingDeepLinkUrl.value != null -> "setup"
+                        hasConfig -> "dashboard"
+                        else -> "setup"
                     }
-                )
+                    AppLog.i(
+                        "Activity",
+                        "Start destination=$startDestination (hasConfig=$hasConfig, " +
+                            "deepLink=${pendingDeepLinkUrl.value != null})"
+                    )
+                }
+
+                val dest = startDestination
+                if (dest != null) {
+                    NavGraph(
+                        startDestination = dest,
+                        deepLinkUrl = pendingDeepLinkUrl.value,
+                        onStartVpn = { configJson ->
+                            AppLog.i(
+                                "Activity",
+                                "onStartVpn callback, configJson=${configJson?.length}"
+                            )
+                            pendingConfigJson = configJson
+                            requestVpnPermission()
+                        },
+                        onStopVpn = {
+                            AppLog.i("Activity", "onStopVpn callback")
+                            BoxService.stop()
+                        }
+                    )
+                }
             }
         }
     }
@@ -97,7 +116,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handleDeepLink(intent: Intent?) {
         val result = DeepLinkHandler.parse(intent?.data) ?: return
-        pendingDeepLinkUrl = result.configUrl
+        pendingDeepLinkUrl.value = result.configUrl
     }
 
     private fun requestVpnPermission() {
@@ -120,10 +139,5 @@ class MainActivity : ComponentActivity() {
         }
         AppLog.i("Activity", "doStartVpn() calling BoxService.start(), config length=${config.length}")
         BoxService.start(this, config)
-    }
-
-    private fun launchQrScanner() {
-        val intent = Intent(this, QrScannerActivity::class.java)
-        qrScannerLauncher.launch(intent)
     }
 }

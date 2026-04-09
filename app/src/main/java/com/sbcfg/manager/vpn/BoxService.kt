@@ -27,6 +27,16 @@ object BoxService : CommandServerHandler {
 
     val status = MutableLiveData(Status.Stopped)
 
+    /**
+     * Wall-clock timestamp (System.currentTimeMillis) of when the tunnel
+     * transitioned to Started. Null while stopped. Lives as long as the
+     * process does — survives Activity/ViewModel recreation so the uptime
+     * counter doesn't reset when the user reopens the app.
+     */
+    @Volatile
+    var startedAt: Long? = null
+        private set
+
     private var commandServer: CommandServer? = null
     private var service: Service? = null
     private var vpnService: VPNService? = null
@@ -95,6 +105,7 @@ object BoxService : CommandServerHandler {
             // 4. Stop Android service
             withContext(Dispatchers.Main) {
                 AppLog.i(TAG, "stopSelf()")
+                startedAt = null
                 status.postValue(Status.Stopped)
                 currentService.stopSelf()
             }
@@ -192,8 +203,9 @@ object BoxService : CommandServerHandler {
                 AppLog.i(TAG, "startOrReloadService() completed successfully")
 
                 withContext(Dispatchers.Main) {
+                    startedAt = System.currentTimeMillis()
                     status.postValue(Status.Started)
-                    AppLog.i(TAG, "Status set to Started")
+                    AppLog.i(TAG, "Status set to Started, startedAt=$startedAt")
                     notification?.show("VPN подключён")
                     binder?.broadcast(Status.Started)
                     startHealthCheck()
@@ -219,6 +231,7 @@ object BoxService : CommandServerHandler {
         service = null
         vpnService = null
         binder = null
+        startedAt = null
         status.postValue(Status.Stopped)
     }
 

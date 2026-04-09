@@ -1,6 +1,7 @@
 package com.sbcfg.manager.ui.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -13,11 +14,20 @@ import com.sbcfg.manager.ui.setup.SetupScreen
 fun NavGraph(
     navController: NavHostController = rememberNavController(),
     startDestination: String,
-    onScanQr: (() -> Unit)? = null,
     deepLinkUrl: String? = null,
     onStartVpn: (configJson: String?) -> Unit = {},
     onStopVpn: () -> Unit = {}
 ) {
+    // If a deep link arrives while the user is outside the setup screen
+    // (e.g. already on dashboard), jump to setup so the URL can be applied.
+    LaunchedEffect(deepLinkUrl) {
+        if (deepLinkUrl != null &&
+            navController.currentDestination?.route != "setup"
+        ) {
+            navController.navigate("setup")
+        }
+    }
+
     NavHost(
         navController = navController,
         startDestination = startDestination
@@ -29,7 +39,6 @@ fun NavGraph(
                         popUpTo("setup") { inclusive = true }
                     }
                 },
-                onScanQr = onScanQr ?: {},
                 deepLinkUrl = deepLinkUrl
             )
         }

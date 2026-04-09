@@ -14,13 +14,11 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -36,7 +34,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 @Composable
 fun SetupScreen(
     onConfigured: () -> Unit,
-    onScanQr: () -> Unit = {},
     deepLinkUrl: String? = null,
     viewModel: SetupViewModel = hiltViewModel()
 ) {
@@ -114,16 +111,6 @@ fun SetupScreen(
             if (state.isLoading) {
                 Spacer(modifier = Modifier.height(16.dp))
                 CircularProgressIndicator()
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-            HorizontalDivider()
-            Spacer(modifier = Modifier.height(16.dp))
-
-            TextButton(
-                onClick = onScanQr
-            ) {
-                Text("Сканировать QR-код")
             }
         }
     }

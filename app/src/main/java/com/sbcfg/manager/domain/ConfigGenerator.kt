@@ -174,10 +174,24 @@ class ConfigGenerator @Inject constructor(
             val inbound = inbounds.getJSONObject(i)
             if (inbound.optString("type") != "tun") continue
 
-            // Add stack if missing
-            if (!inbound.has("stack")) {
-                inbound.put("stack", "mixed")
-                AppLog.i("ConfigGen", "Added stack=mixed to tun inbound")
+            // Force gvisor TCP/IP stack on Android. The "system" (and "mixed")
+            // stack tries to bind real sockets to the underlying interface via
+            // setsockopt(SO_BINDTODEVICE), which requires root on Android and
+            // fails with "operation not permitted" — as a result TCP packets
+            // from tunneled apps never reach sing-box (only UDP/DNS does).
+            // gvisor is a pure userspace stack that doesn't need that perm.
+            val currentStack = inbound.optString("stack")
+            if (currentStack != "gvisor") {
+                inbound.put("stack", "gvisor")
+                AppLog.i("ConfigGen", "Forced stack=gvisor (was '$currentStack')")
+            }
+
+            // strict_route=true on Android + per-app VPN can drop packets that
+            // don't match the configured routes. Turn it off so packets from
+            // tunneled apps reach the TUN inbound unconditionally.
+            if (inbound.optBoolean("strict_route", false)) {
+                inbound.put("strict_route", false)
+                AppLog.i("ConfigGen", "Disabled strict_route on tun inbound")
             }
 
             // Remove legacy sniff fields (removed in 1.13)

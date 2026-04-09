@@ -163,6 +163,10 @@ private fun AppRuleItem(
     onModeChanged: (AppMode) -> Unit,
     onRemove: () -> Unit
 ) {
+    // No row-level focusable wrapper: on TV the D-pad should walk directly
+    // between the chips (VPN / Авто / Без VPN) in each row, without an extra
+    // "select the row first" step. LazyColumn auto-scrolls to the focused
+    // chip via the foundation bringIntoView mechanism.
     Column(
         modifier = Modifier
             .fillMaxWidth()

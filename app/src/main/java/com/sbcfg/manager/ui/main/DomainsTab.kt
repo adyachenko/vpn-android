@@ -126,6 +126,10 @@ private fun DomainItem(
     domain: CustomDomainEntity,
     onDelete: () -> Unit
 ) {
+    // No row-level wrapper: on TV the D-pad should land directly on the
+    // delete IconButton for user-added domains. Server-provided rows have no
+    // focusable children and are skipped by focus search, which is fine —
+    // they're read-only anyway.
     ListItem(
         headlineContent = { Text(domain.domain) },
         supportingContent = {

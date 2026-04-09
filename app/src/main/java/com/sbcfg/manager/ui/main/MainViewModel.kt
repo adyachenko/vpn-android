@@ -3,9 +3,11 @@ package com.sbcfg.manager.ui.main
 import android.app.Application
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.sbcfg.manager.data.preferences.AppPreferences
 import com.sbcfg.manager.domain.ConfigManager
 import com.sbcfg.manager.domain.model.ConfigState
 import com.sbcfg.manager.util.AppLog
+import com.sbcfg.manager.vpn.BoxService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,6 +21,7 @@ import javax.inject.Inject
 @HiltViewModel
 class MainViewModel @Inject constructor(
     private val configManager: ConfigManager,
+    private val appPreferences: AppPreferences,
     private val app: Application
 ) : ViewModel() {
 
@@ -51,6 +54,9 @@ class MainViewModel @Inject constructor(
         AppLog.i("ViewModel", "onToggleVpn() called, vpnRunning=${_uiState.value.vpnRunning}")
         if (_uiState.value.vpnRunning) {
             viewModelScope.launch {
+                // Remember the user wants VPN off — so the next boot won't
+                // auto-resume the tunnel.
+                appPreferences.setVpnWasRunning(false)
                 AppLog.i("ViewModel", "Sending SideEffect.StopVpn")
                 _sideEffect.send(SideEffect.StopVpn)
             }
@@ -61,6 +67,9 @@ class MainViewModel @Inject constructor(
                     AppLog.i("ViewModel", "Generating config JSON...")
                     pendingConfigJson = configManager.generateConfigJson()
                     AppLog.i("ViewModel", "Config generated, length=${pendingConfigJson?.length}")
+                    // Remember the user wants VPN on — the next boot will
+                    // auto-resume the tunnel if autostart is enabled.
+                    appPreferences.setVpnWasRunning(true)
                     AppLog.i("ViewModel", "Sending SideEffect.RequestVpnPermission")
                     _sideEffect.send(SideEffect.RequestVpnPermission)
                 } catch (e: Exception) {
@@ -83,14 +92,14 @@ class MainViewModel @Inject constructor(
 
     fun onVpnStatusChanged(running: Boolean) {
         AppLog.i("ViewModel", "onVpnStatusChanged($running)")
+        // Read the start timestamp from BoxService — it's the source of
+        // truth and survives Activity/ViewModel recreation. Generating the
+        // timestamp here would reset the uptime counter every time the user
+        // reopens the app.
         _uiState.update {
             it.copy(
                 vpnRunning = running,
-                vpnStartedAt = when {
-                    running && it.vpnStartedAt == null -> System.currentTimeMillis()
-                    !running -> null
-                    else -> it.vpnStartedAt
-                }
+                vpnStartedAt = if (running) BoxService.startedAt else null
             )
         }
     }

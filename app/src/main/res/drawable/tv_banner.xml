@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android TV banner, 320x180 per Leanback guidelines.
+  Used by the launcher to represent the app on the TV home screen.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180"
+    tools:ignore="VectorRaster">
+
+    <!-- Background -->
+    <path
+        android:fillColor="#1A1B1E"
+        android:pathData="M0,0h320v180h-320z" />
+
+    <!-- Accent bar on the left -->
+    <path
+        android:fillColor="#7AB4FF"
+        android:pathData="M0,0h6v180h-6z" />
+
+    <!-- Shield silhouette (simple geometric, centered vertically, left half) -->
+    <path
+        android:fillColor="#7AB4FF"
+        android:pathData="M70,50 L110,50 L130,70 L130,110 Q130,140 100,150 Q70,140 70,110 Z" />
+
+    <!-- Inner shield highlight -->
+    <path
+        android:fillColor="#1A1B1E"
+        android:pathData="M80,62 L118,62 L122,74 L122,108 Q122,130 100,138 Q78,130 78,108 Z" />
+
+    <!-- Checkmark inside shield -->
+    <path
+        android:fillColor="#7AB4FF"
+        android:pathData="M86,96 L96,110 L118,84 L112,80 L96,102 L90,92 Z" />
+
+    <!-- App name: block-letter paths forming "SBOXY" on the right side -->
+    <!-- S -->
+    <path
+        android:fillColor="#E6E6E6"
+        android:pathData="M155,70 h24 v10 h-18 v8 h16 v10 h-16 v10 h18 v10 h-24 Z" />
+    <!-- B -->
+    <path
+        android:fillColor="#E6E6E6"
+        android:pathData="M185,70 h20 q6,0 6,10 q0,6 -4,8 q4,2 4,10 q0,10 -6,10 h-20 Z M195,80 v6 h8 v-6 Z M195,96 v8 h8 v-8 Z" />
+    <!-- O -->
+    <path
+        android:fillColor="#E6E6E6"
+        android:pathData="M217,70 h22 v48 h-22 Z M225,80 v28 h6 v-28 Z" />
+    <!-- X -->
+    <path
+        android:fillColor="#E6E6E6"
+        android:pathData="M245,70 h8 l6,10 l6,-10 h8 l-10,24 l10,24 h-8 l-6,-10 l-6,10 h-8 l10,-24 Z" />
+    <!-- Y -->
+    <path
+        android:fillColor="#E6E6E6"
+        android:pathData="M275,70 h8 l6,14 l6,-14 h8 l-10,24 v24 h-8 v-24 Z" />
+
+    <!-- Subtitle dot pattern -->
+    <path
+        android:fillColor="#5A6170"
+        android:pathData="M155,130 h4 v4 h-4 Z M163,130 h4 v4 h-4 Z M171,130 h4 v4 h-4 Z M179,130 h4 v4 h-4 Z M187,130 h4 v4 h-4 Z" />
+</vector>

@@ -33,8 +33,12 @@ class BootReceiver : BroadcastReceiver() {
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val autoStart = appPreferences.autoStart.first()
-                AppLog.i(TAG, "autoStart=$autoStart")
-                if (!autoStart) return@launch
+                val vpnWasRunning = appPreferences.vpnWasRunning.first()
+                AppLog.i(TAG, "autoStart=$autoStart vpnWasRunning=$vpnWasRunning")
+                // Resume only if autostart is on AND VPN was running when the
+                // device went down. If the user manually stopped before
+                // reboot, we honor that and stay off.
+                if (!autoStart || !vpnWasRunning) return@launch
 
                 val configJson = try {
                     configGenerator.generate()

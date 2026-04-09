@@ -1,5 +1,6 @@
 package com.sbcfg.manager.integration
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
@@ -9,6 +10,7 @@ import android.service.quicksettings.TileService
 import androidx.lifecycle.Observer
 import com.sbcfg.manager.MainActivity
 import com.sbcfg.manager.constant.Status
+import com.sbcfg.manager.data.preferences.AppPreferences
 import com.sbcfg.manager.domain.ConfigManager
 import com.sbcfg.manager.util.AppLog
 import com.sbcfg.manager.vpn.BoxService
@@ -28,6 +30,7 @@ class VpnTileService : TileService() {
     }
 
     @Inject lateinit var configManager: ConfigManager
+    @Inject lateinit var appPreferences: AppPreferences
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var statusObserver: Observer<Status>? = null
@@ -57,6 +60,8 @@ class VpnTileService : TileService() {
         AppLog.i(TAG, "Tile clicked, current status=$status")
         when (status) {
             Status.Started, Status.Starting -> {
+                // Remember the user wants VPN off.
+                scope.launch { appPreferences.setVpnWasRunning(false) }
                 BoxService.stop()
             }
             else -> {
@@ -76,6 +81,9 @@ class VpnTileService : TileService() {
         scope.launch {
             try {
                 val config = configManager.generateConfigJson()
+                // Remember the user wants VPN on — the next boot will
+                // auto-resume the tunnel if autostart is enabled.
+                appPreferences.setVpnWasRunning(true)
                 BoxService.start(applicationContext, config)
                 AppLog.i(TAG, "VPN started from tile")
             } catch (e: Exception) {
@@ -98,6 +106,7 @@ class VpnTileService : TileService() {
             startActivityAndCollapse(pi)
         } else {
             @Suppress("DEPRECATION")
+            @SuppressLint("StartActivityAndCollapseDeprecated")
             startActivityAndCollapse(intent)
         }
     }

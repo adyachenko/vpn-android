@@ -69,6 +69,18 @@ android {
         buildConfig = true
         aidl = true
     }
+
+    // Separate APK per ABI instead of a fat 200+ MB APK with all 4 architectures.
+    // arm64-v8a covers modern phones/TV boxes; armeabi-v7a is kept for older devices
+    // (old TV sticks, cheap Android TVs). x86/x86_64 are dropped — emulator only.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
+        }
+    }
 }
 
 dependencies {
@@ -120,14 +132,6 @@ dependencies {
 
     // libbox (sing-box core)
     implementation(files("libs/libbox.aar"))
-
-    // CameraX (QR scanner)
-    implementation("androidx.camera:camera-camera2:1.4.1")
-    implementation("androidx.camera:camera-lifecycle:1.4.1")
-    implementation("androidx.camera:camera-view:1.4.1")
-
-    // ML Kit Barcode
-    implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
     // Debug
     debugImplementation("androidx.compose.ui:ui-tooling")

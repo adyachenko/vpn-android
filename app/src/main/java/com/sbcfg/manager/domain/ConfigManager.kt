@@ -164,6 +164,8 @@ class ConfigManager @Inject constructor(
     suspend fun generateConfig(context: Context): File = configGenerator.generateToFile(context)
 
     // State observation
+    suspend fun hasConfig(): Boolean = serverConfigDao.get() != null
+
     fun observeConfigState(): Flow<ConfigState> = serverConfigDao.observe().map { entity ->
         if (entity == null) {
             ConfigState.NotConfigured
