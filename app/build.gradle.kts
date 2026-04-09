@@ -7,12 +7,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
-val versionProps = java.util.Properties().apply {
-    load(rootProject.file("version.properties").inputStream())
-}
-val vMajor = versionProps["VERSION_MAJOR"].toString().toInt()
-val vMinor = versionProps["VERSION_MINOR"].toString().toInt()
-val vPatch = versionProps["VERSION_PATCH"].toString().toInt()
+val versionMap = rootProject.file("version.properties").readLines()
+    .filter { it.contains("=") }
+    .associate { line -> line.substringBefore("=").trim() to line.substringAfter("=").trim() }
+val vMajor = versionMap.getValue("VERSION_MAJOR").toInt()
+val vMinor = versionMap.getValue("VERSION_MINOR").toInt()
+val vPatch = versionMap.getValue("VERSION_PATCH").toInt()
 
 android {
     namespace = "com.sbcfg.manager"
