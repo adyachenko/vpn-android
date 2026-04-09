@@ -25,7 +25,8 @@ class MainViewModel @Inject constructor(
     data class UiState(
         val configState: ConfigState = ConfigState.NotConfigured,
         val isGenerating: Boolean = false,
-        val vpnRunning: Boolean = false
+        val vpnRunning: Boolean = false,
+        val vpnStartedAt: Long? = null
     )
 
     private val _uiState = MutableStateFlow(UiState())
@@ -82,6 +83,15 @@ class MainViewModel @Inject constructor(
 
     fun onVpnStatusChanged(running: Boolean) {
         AppLog.i("ViewModel", "onVpnStatusChanged($running)")
-        _uiState.update { it.copy(vpnRunning = running) }
+        _uiState.update {
+            it.copy(
+                vpnRunning = running,
+                vpnStartedAt = when {
+                    running && it.vpnStartedAt == null -> System.currentTimeMillis()
+                    !running -> null
+                    else -> it.vpnStartedAt
+                }
+            )
+        }
     }
 }

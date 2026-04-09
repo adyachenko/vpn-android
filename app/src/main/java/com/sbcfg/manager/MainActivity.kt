@@ -49,6 +49,14 @@ class MainActivity : ComponentActivity() {
     private var serviceConnection: ServiceConnection? = null
     private var pendingDeepLinkUrl: String? = null
 
+    override fun onResume() {
+        super.onResume()
+        // Reapply edge-to-edge on resume — some OEM ROMs (Vivo) reset window decor
+        // when the activity is brought back from the recents stack, hiding the
+        // TopAppBar icons under the system status bar.
+        enableEdgeToEdge()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -59,10 +67,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             SbcfgTheme {
                 NavGraph(
-                    startDestination = "main",
+                    startDestination = "dashboard",
                     onScanQr = { launchQrScanner() },
                     deepLinkUrl = pendingDeepLinkUrl?.also { pendingDeepLinkUrl = null },
-                    onRequestVpnPermission = { requestVpnPermission() },
                     onStartVpn = { configJson ->
                         AppLog.i("Activity", "onStartVpn callback, configJson=${configJson?.length}")
                         pendingConfigJson = configJson

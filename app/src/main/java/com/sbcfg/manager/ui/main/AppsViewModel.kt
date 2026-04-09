@@ -25,56 +25,53 @@ class AppsViewModel @Inject constructor(
     data class AppWithRule(
         val packageName: String,
         val appName: String,
-        val icon: Drawable,
+        val icon: Drawable?,
         val mode: AppMode,
         val isFromServer: Boolean
     )
 
+    /** Item shown inside the "add app" picker dialog. */
+    data class PickerItem(
+        val packageName: String,
+        val appName: String,
+        val icon: Drawable
+    )
+
     data class UiState(
-        val apps: List<AppWithRule> = emptyList(),
-        val searchQuery: String = "",
-        val isLoading: Boolean = true
+        val rules: List<AppWithRule> = emptyList(),
+        val isLoading: Boolean = true,
+        val showPicker: Boolean = false,
+        val pickerSearch: String = "",
+        val pickerItems: List<PickerItem> = emptyList()
     )
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
-    private var allApps: List<AppWithRule> = emptyList()
+    private var allInstalled: List<AppResolver.AppInfo> = emptyList()
+    private val installedByPackage: MutableMap<String, AppResolver.AppInfo> = mutableMapOf()
 
     init {
-        loadApps()
-    }
-
-    private fun loadApps() {
         viewModelScope.launch {
-            val installedApps = withContext(Dispatchers.IO) {
-                appResolver.getInstalledApps()
-            }
+            allInstalled = withContext(Dispatchers.IO) { appResolver.getInstalledApps() }
+            installedByPackage.clear()
+            installedByPackage.putAll(allInstalled.associateBy { it.packageName })
 
             configManager.observeAppRules().collect { rules ->
-                val rulesMap = rules.associateBy { it.packageName }
-
-                allApps = installedApps.map { appInfo ->
-                    val rule = rulesMap[appInfo.packageName]
+                val mapped = rules.map { rule ->
+                    val info = installedByPackage[rule.packageName]
                     AppWithRule(
-                        packageName = appInfo.packageName,
-                        appName = appInfo.appName,
-                        icon = appInfo.icon,
-                        mode = rule?.let {
-                            AppMode.valueOf(it.mode.uppercase())
-                        } ?: AppMode.PROXY,
-                        isFromServer = rule?.isFromServer ?: false
+                        packageName = rule.packageName,
+                        appName = info?.appName ?: rule.appName.takeIf { it.isNotBlank() }
+                            ?: rule.packageName,
+                        icon = info?.icon,
+                        mode = AppMode.valueOf(rule.mode.uppercase()),
+                        isFromServer = rule.isFromServer
                     )
                 }
-
-                applyFilter()
+                _uiState.update { it.copy(rules = mapped, isLoading = false) }
             }
         }
-    }
-
-    fun onSearchQueryChanged(query: String) {
-        _uiState.update { it.copy(searchQuery = query) }
-        applyFilter()
     }
 
     fun onSetAppMode(packageName: String, appName: String, mode: AppMode) {
@@ -83,16 +80,35 @@ class AppsViewModel @Inject constructor(
         }
     }
 
-    private fun applyFilter() {
-        val query = _uiState.value.searchQuery.lowercase()
-        val filtered = if (query.isBlank()) {
-            allApps
-        } else {
-            allApps.filter {
-                it.appName.lowercase().contains(query) ||
-                    it.packageName.lowercase().contains(query)
-            }
+    fun onRemoveApp(packageName: String) {
+        viewModelScope.launch {
+            configManager.removeAppRule(packageName)
         }
-        _uiState.update { it.copy(apps = filtered, isLoading = false) }
+    }
+
+    fun onShowPicker() {
+        val existing = _uiState.value.rules.map { it.packageName }.toSet()
+        val items = allInstalled
+            .filter { it.packageName !in existing }
+            .map { PickerItem(it.packageName, it.appName, it.icon) }
+        _uiState.update {
+            it.copy(showPicker = true, pickerSearch = "", pickerItems = items)
+        }
+    }
+
+    fun onDismissPicker() {
+        _uiState.update { it.copy(showPicker = false, pickerSearch = "") }
+    }
+
+    fun onPickerSearchChanged(query: String) {
+        _uiState.update { it.copy(pickerSearch = query) }
+    }
+
+    fun onPickApp(packageName: String, appName: String) {
+        viewModelScope.launch {
+            // Default new apps to "direct" — through the tunnel with domain-based routing.
+            configManager.setAppMode(packageName, appName, AppMode.DIRECT)
+        }
+        onDismissPicker()
     }
 }

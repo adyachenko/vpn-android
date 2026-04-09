@@ -1,5 +1,9 @@
 package com.sbcfg.manager.ui.main
 
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -128,29 +133,120 @@ fun SettingsTab(
 
             // Auto-start
             item {
+                val context = LocalContext.current
                 Card(modifier = Modifier.fillMaxWidth()) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Автозапуск VPN",
-                                style = MaterialTheme.typography.titleSmall
-                            )
-                            Text(
-                                text = "Запускать VPN при включении устройства",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Автозапуск VPN",
+                                    style = MaterialTheme.typography.titleSmall
+                                )
+                                Text(
+                                    text = "Запускать VPN при включении устройства",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = state.autoStart,
+                                onCheckedChange = viewModel::onAutoStartChanged
                             )
                         }
-                        Switch(
-                            checked = state.autoStart,
-                            onCheckedChange = viewModel::onAutoStartChanged
-                        )
+                        AnimatedVisibility(visible = state.autoStart) {
+                            Column(modifier = Modifier.padding(top = 12.dp)) {
+                                Text(
+                                    text = "Для работы автозапуска необходимо:",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                // Always-on VPN
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                                    )
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "Постоянная VPN",
+                                                style = MaterialTheme.typography.labelLarge
+                                            )
+                                            Text(
+                                                text = "Включите «Постоянная VPN» и «Блокировать без VPN» для Config Manager",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        OutlinedButton(
+                                            onClick = {
+                                                context.startActivity(
+                                                    Intent(Settings.ACTION_VPN_SETTINGS)
+                                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                )
+                                            }
+                                        ) {
+                                            Text("Открыть")
+                                        }
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                // Battery optimization
+                                Card(
+                                    colors = CardDefaults.cardColors(
+                                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                                    )
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = "Автозапуск приложения",
+                                                style = MaterialTheme.typography.labelLarge
+                                            )
+                                            Text(
+                                                text = "Отключите оптимизацию батареи и разрешите автозапуск в настройках устройства",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        OutlinedButton(
+                                            onClick = {
+                                                context.startActivity(
+                                                    Intent(
+                                                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                                        Uri.parse("package:${context.packageName}")
+                                                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                )
+                                            }
+                                        ) {
+                                            Text("Открыть")
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

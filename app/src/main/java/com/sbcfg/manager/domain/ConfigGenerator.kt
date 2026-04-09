@@ -5,6 +5,7 @@ import com.sbcfg.manager.data.local.dao.AppRuleDao
 import com.sbcfg.manager.data.local.dao.CustomDomainDao
 import com.sbcfg.manager.data.local.dao.ServerConfigDao
 import com.sbcfg.manager.util.AppLog
+import dagger.hilt.android.qualifiers.ApplicationContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -13,6 +14,7 @@ import javax.inject.Singleton
 
 @Singleton
 class ConfigGenerator @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val serverConfigDao: ServerConfigDao,
     private val customDomainDao: CustomDomainDao,
     private val appRuleDao: AppRuleDao
@@ -26,7 +28,7 @@ class ConfigGenerator @Inject constructor(
         // Enable logging to file for debugging
         val log = json.optJSONObject("log") ?: JSONObject().also { json.put("log", it) }
         log.put("level", "info")
-        log.put("output", "/data/user/0/com.sbcfg.manager/files/sing-box.log")
+        log.put("output", "${context.filesDir.absolutePath}/sing-box.log")
 
         // Migrate legacy tun fields (removed in sing-box 1.12.0)
         migrateLegacyTunFields(json)
@@ -68,9 +70,9 @@ class ConfigGenerator @Inject constructor(
             .map { it.domain }
 
         // Get app rules
-        val directApps = appRuleDao.getByMode("direct")
+        val proxyApps = appRuleDao.getByMode("proxy")
             .map { it.packageName }
-        val bypassApps = appRuleDao.getByMode("bypass")
+        val directApps = appRuleDao.getByMode("direct")
             .map { it.packageName }
 
         // 1. Add direct domains to route.rule_set[tag="sites-direct"].rules[0].domain_suffix
@@ -83,14 +85,22 @@ class ConfigGenerator @Inject constructor(
             addProxyDomainsRule(json, userProxyDomains)
         }
 
-        // 3. Add direct apps to route.rules[].package_name AND inbounds[tun].exclude_package
-        if (directApps.isNotEmpty()) {
-            addDirectApps(json, directApps)
+        // 3. Configure include_package on TUN inbound
+        // - "proxy" apps go through tunnel and ALL traffic forced to proxy outbound
+        // - "direct" apps go through tunnel with normal domain-based routing
+        // - All other apps (default = bypass) are NOT in include_package -> outside VPN entirely
+        // CRITICAL: include_package must be NON-EMPTY, otherwise Android VpnService falls
+        // back to "tunnel everything" because no addAllowedApplication() call is made.
+        // When user has no apps selected, we use a placeholder package name that doesn't
+        // exist on the device — this keeps the whitelist active but matches nothing.
+        val tunneledApps = (proxyApps + directApps).distinct().ifEmpty {
+            listOf("com.sbcfg.manager.placeholder.no_apps_selected")
         }
+        applyIncludePackage(json, tunneledApps)
 
-        // 4. Add bypass apps ONLY to inbounds[tun].exclude_package
-        if (bypassApps.isNotEmpty()) {
-            addBypassApps(json, bypassApps)
+        // 4. Add route rule forcing proxy outbound for "proxy" apps
+        if (proxyApps.isNotEmpty()) {
+            addProxyAppsRule(json, proxyApps)
         }
 
         val result = json.toString(2)
@@ -488,52 +498,64 @@ class ConfigGenerator @Inject constructor(
         route.put("rules", newRules)
     }
 
-    private fun addDirectApps(json: JSONObject, packageNames: List<String>) {
-        // Add to route.rules[].package_name where outbound is "direct-out"
-        val route = json.getJSONObject("route")
-        val rules = route.getJSONArray("rules")
-        for (i in 0 until rules.length()) {
-            val rule = rules.getJSONObject(i)
-            if (rule.has("package_name") && rule.optString("outbound") == "direct-out") {
-                val pkgArray = rule.getJSONArray("package_name")
-                for (pkg in packageNames) {
-                    pkgArray.put(pkg)
-                }
-                break
-            }
-        }
-
-        // Also add to inbounds[type=tun].exclude_package
-        addToExcludePackage(json, packageNames)
-    }
-
-    private fun addBypassApps(json: JSONObject, packageNames: List<String>) {
-        addToExcludePackage(json, packageNames)
-    }
-
-    private fun addToExcludePackage(json: JSONObject, packageNames: List<String>) {
+    /**
+     * Apply include_package mode on TUN inbound — only listed packages route through VPN.
+     * All other apps (and the SBoxy app itself) bypass the tunnel automatically.
+     * Also strips any leftover exclude_package from the template, since the two are mutually exclusive.
+     */
+    private fun applyIncludePackage(json: JSONObject, packageNames: List<String>) {
         val inbounds = json.getJSONArray("inbounds")
         for (i in 0 until inbounds.length()) {
             val inbound = inbounds.getJSONObject(i)
-            if (inbound.optString("type") == "tun") {
-                val excludePackage = inbound.optJSONArray("exclude_package") ?: JSONArray().also {
-                    inbound.put("exclude_package", it)
-                }
-                for (pkg in packageNames) {
-                    // Avoid duplicates
-                    var exists = false
-                    for (j in 0 until excludePackage.length()) {
-                        if (excludePackage.getString(j) == pkg) {
-                            exists = true
-                            break
-                        }
-                    }
-                    if (!exists) {
-                        excludePackage.put(pkg)
-                    }
-                }
-                break
+            if (inbound.optString("type") != "tun") continue
+
+            // Remove exclude_package — incompatible with include_package
+            if (inbound.has("exclude_package")) {
+                inbound.remove("exclude_package")
+                AppLog.i("ConfigGen", "Removed exclude_package (using include_package mode)")
             }
+
+            // Merge with any include_package already set in template
+            val include = inbound.optJSONArray("include_package") ?: JSONArray().also {
+                inbound.put("include_package", it)
+            }
+            val existing = mutableSetOf<String>()
+            for (j in 0 until include.length()) existing.add(include.getString(j))
+            for (pkg in packageNames) {
+                if (existing.add(pkg)) include.put(pkg)
+            }
+            AppLog.i("ConfigGen", "include_package set: ${existing.size} apps tunneled")
+            break
         }
+    }
+
+    /**
+     * Insert a route rule that forces all traffic from given packages to the proxy outbound.
+     * Placed at the top of route.rules so it overrides domain-based rules.
+     */
+    private fun addProxyAppsRule(json: JSONObject, packageNames: List<String>) {
+        val route = json.getJSONObject("route")
+        val rules = route.optJSONArray("rules") ?: JSONArray().also { route.put("rules", it) }
+
+        val proxyAppsRule = JSONObject().apply {
+            put("package_name", JSONArray(packageNames))
+            put("outbound", "proxy-select")
+        }
+
+        // Insert AFTER sniff/hijack-dns actions but BEFORE other routing rules
+        val newRules = JSONArray()
+        var inserted = false
+        for (i in 0 until rules.length()) {
+            val rule = rules.getJSONObject(i)
+            val action = rule.optString("action")
+            if (!inserted && action != "sniff" && action != "hijack-dns") {
+                newRules.put(proxyAppsRule)
+                inserted = true
+            }
+            newRules.put(rule)
+        }
+        if (!inserted) newRules.put(proxyAppsRule)
+        route.put("rules", newRules)
+        AppLog.i("ConfigGen", "Added proxy apps route rule for ${packageNames.size} apps")
     }
 }

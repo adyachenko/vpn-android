@@ -152,6 +152,10 @@ class ConfigManager @Inject constructor(
         )
     }
 
+    suspend fun removeAppRule(packageName: String) {
+        appRuleDao.deleteByPackage(packageName)
+    }
+
     fun observeAppRules(): Flow<List<AppRuleEntity>> = appRuleDao.observeAll()
 
     // Config generation
@@ -229,21 +233,26 @@ class ConfigManager @Inject constructor(
         val inbounds = json.optJSONArray("inbounds") ?: return
         for (i in 0 until inbounds.length()) {
             val inbound = inbounds.getJSONObject(i)
-            if (inbound.optString("type") == "tun") {
-                val excludePackage = inbound.optJSONArray("exclude_package") ?: return
-                for (j in 0 until excludePackage.length()) {
-                    val pkg = excludePackage.getString(j)
+            if (inbound.optString("type") != "tun") continue
+
+            // New model: server template uses include_package to specify
+            // apps that should be tunneled by default. They get "direct" mode
+            // (through tunnel + domain-based routing).
+            val includePackage = inbound.optJSONArray("include_package")
+            if (includePackage != null) {
+                for (j in 0 until includePackage.length()) {
+                    val pkg = includePackage.getString(j)
                     appRuleDao.upsert(
                         AppRuleEntity(
                             packageName = pkg,
-                            appName = pkg, // Will be resolved to display name by AppResolver
-                            mode = "bypass",
+                            appName = pkg,
+                            mode = "direct",
                             isFromServer = true
                         )
                     )
                 }
-                break
             }
+            break
         }
     }
 }

@@ -9,6 +9,10 @@ build/
 *.iws
 *.ipr
 
+# Tooling state
+.serena/
+.claude/
+
 # Local config
 local.properties
 

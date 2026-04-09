@@ -182,6 +182,17 @@ class VPNService : VpnService(), PlatformInterface {
                         InetSocketAddress(dstAddr, dstPort)
                     )
                 owner.userId = uid
+                if (uid > 0) {
+                    val packages = packageManager.getPackagesForUid(uid)?.toList().orEmpty()
+                    if (packages.isNotEmpty()) {
+                        owner.setAndroidPackageNames(object : StringIterator {
+                            private val iter = packages.iterator()
+                            override fun hasNext(): Boolean = iter.hasNext()
+                            override fun next(): String = iter.next()
+                            override fun len(): Int = packages.size
+                        })
+                    }
+                }
             } catch (e: Exception) {
                 AppLog.e(TAG, "findConnectionOwner error", e)
             }
@@ -274,7 +285,10 @@ class VPNService : VpnService(), PlatformInterface {
 
     override fun underNetworkExtension(): Boolean = false
 
-    override fun useProcFS(): Boolean = true
+    // Android 10+ blocks /proc/net/* via SELinux. sing-box must rely on
+    // findConnectionOwner() / Android's ConnectivityManager.getConnectionOwnerUid()
+    // for per-package routing — otherwise package_name rules never match.
+    override fun useProcFS(): Boolean = android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q
 
     private fun getConnectivityManager(): ConnectivityManager {
         return getSystemService(ConnectivityManager::class.java)

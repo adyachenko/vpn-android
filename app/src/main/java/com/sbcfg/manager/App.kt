@@ -2,14 +2,25 @@ package com.sbcfg.manager
 
 import android.app.Application
 import com.sbcfg.manager.util.AppLog
+import com.sbcfg.manager.vpn.ConfigChangeWatcher
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import java.io.File
+import javax.inject.Inject
 
 @HiltAndroidApp
 class App : Application() {
+
+    @Inject lateinit var configChangeWatcher: ConfigChangeWatcher
+
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     override fun onCreate() {
         super.onCreate()
         setupLibbox()
+        configChangeWatcher.start(appScope)
     }
 
     private fun setupLibbox() {

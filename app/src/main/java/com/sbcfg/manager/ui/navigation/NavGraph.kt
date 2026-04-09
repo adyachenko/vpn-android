@@ -5,7 +5,8 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import com.sbcfg.manager.ui.main.MainScreen
+import com.sbcfg.manager.ui.dashboard.DashboardScreen
+import com.sbcfg.manager.ui.settings.SettingsScreen
 import com.sbcfg.manager.ui.setup.SetupScreen
 
 @Composable
@@ -14,7 +15,6 @@ fun NavGraph(
     startDestination: String,
     onScanQr: (() -> Unit)? = null,
     deepLinkUrl: String? = null,
-    onRequestVpnPermission: () -> Unit = {},
     onStartVpn: (configJson: String?) -> Unit = {},
     onStopVpn: () -> Unit = {}
 ) {
@@ -25,7 +25,7 @@ fun NavGraph(
         composable("setup") {
             SetupScreen(
                 onConfigured = {
-                    navController.navigate("main") {
+                    navController.navigate("dashboard") {
                         popUpTo("setup") { inclusive = true }
                     }
                 },
@@ -33,11 +33,16 @@ fun NavGraph(
                 deepLinkUrl = deepLinkUrl
             )
         }
-        composable("main") {
-            MainScreen(
-                onRequestVpnPermission = onRequestVpnPermission,
+        composable("dashboard") {
+            DashboardScreen(
+                onOpenSettings = { navController.navigate("settings") },
                 onStartVpn = onStartVpn,
                 onStopVpn = onStopVpn
+            )
+        }
+        composable("settings") {
+            SettingsScreen(
+                onBack = { navController.popBackStack() }
             )
         }
     }

@@ -12,8 +12,12 @@ import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
 import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.SystemProxyStatus
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -29,6 +33,8 @@ object BoxService : CommandServerHandler {
     private var notification: ServiceNotification? = null
     private var configContent: String? = null
     private var binder: ServiceBinder? = null
+    private var healthCheck: VpnHealthCheck? = null
+    private var healthScope: CoroutineScope? = null
 
     fun start(context: Context, configContent: String) {
         AppLog.i(TAG, "start() called, current status=${status.value}")
@@ -63,6 +69,7 @@ object BoxService : CommandServerHandler {
         }
         status.postValue(Status.Stopping)
         AppLog.i(TAG, "Status set to Stopping")
+        stopHealthCheck()
         notification?.close()
         GlobalScope.launch(Dispatchers.IO) {
             // 1. Close TUN fd
@@ -103,6 +110,36 @@ object BoxService : CommandServerHandler {
             } catch (e: Exception) {
                 AppLog.e(TAG, "Error reloading service", e)
             }
+        }
+    }
+
+    /**
+     * Full VPN restart with a new config: stop current tunnel, wait for shutdown,
+     * then start again. Required when per-app routing changes (include_package),
+     * because that whitelist is frozen until VpnService.Builder.establish() is
+     * called again.
+     */
+    fun restart(context: Context, newConfig: String) {
+        AppLog.i(TAG, "restart() requested, current status=${status.value}")
+        if (status.value != Status.Started) {
+            AppLog.i(TAG, "Not running — saving config only")
+            this.configContent = newConfig
+            return
+        }
+        GlobalScope.launch(Dispatchers.Main) {
+            stop()
+            // Wait for the engine to actually shut down before re-creating it.
+            val deadline = System.currentTimeMillis() + 5000
+            while (status.value != Status.Stopped && System.currentTimeMillis() < deadline) {
+                delay(100)
+            }
+            if (status.value != Status.Stopped) {
+                AppLog.w(TAG, "restart() timed out waiting for stop")
+                return@launch
+            }
+            delay(300)
+            start(context, newConfig)
+            AppLog.i(TAG, "restart() completed")
         }
     }
 
@@ -159,6 +196,7 @@ object BoxService : CommandServerHandler {
                     AppLog.i(TAG, "Status set to Started")
                     notification?.show("VPN подключён")
                     binder?.broadcast(Status.Started)
+                    startHealthCheck()
                 }
             } catch (e: Exception) {
                 AppLog.e(TAG, "Failed to start service", e)
@@ -171,6 +209,7 @@ object BoxService : CommandServerHandler {
 
     internal fun onServiceDestroy() {
         AppLog.i(TAG, "onServiceDestroy()")
+        stopHealthCheck()
         try {
             commandServer?.close()
         } catch (_: Exception) {}
@@ -181,6 +220,36 @@ object BoxService : CommandServerHandler {
         vpnService = null
         binder = null
         status.postValue(Status.Stopped)
+    }
+
+    private fun startHealthCheck() {
+        stopHealthCheck()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        healthScope = scope
+        healthCheck = VpnHealthCheck(onUnhealthy = ::onVpnUnhealthy).also {
+            it.start(scope)
+        }
+    }
+
+    private fun stopHealthCheck() {
+        healthCheck?.stop()
+        healthCheck = null
+        healthScope?.cancel()
+        healthScope = null
+    }
+
+    private fun onVpnUnhealthy() {
+        AppLog.e(TAG, "Health check reported VPN unhealthy — reloading sing-box engine")
+        val config = configContent ?: return
+        GlobalScope.launch(Dispatchers.IO) {
+            try {
+                val overrideOptions = OverrideOptions()
+                commandServer?.startOrReloadService(config, overrideOptions)
+                AppLog.i(TAG, "VPN engine reloaded after health check failure")
+            } catch (e: Exception) {
+                AppLog.e(TAG, "Reload after health check failure failed", e)
+            }
+        }
     }
 
     internal fun stopAndAlert(type: Alert, message: String) {

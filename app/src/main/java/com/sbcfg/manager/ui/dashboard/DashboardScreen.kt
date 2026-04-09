@@ -1,0 +1,394 @@
+package com.sbcfg.manager.ui.dashboard
+
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.livedata.observeAsState
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.sbcfg.manager.constant.Status
+import com.sbcfg.manager.domain.model.ConfigState
+import com.sbcfg.manager.ui.main.MainViewModel
+import com.sbcfg.manager.ui.main.SideEffect
+import com.sbcfg.manager.util.AppLog
+import com.sbcfg.manager.vpn.BoxService
+import kotlinx.coroutines.delay
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun DashboardScreen(
+    viewModel: MainViewModel = hiltViewModel(),
+    onOpenSettings: () -> Unit = {},
+    onStartVpn: (configJson: String?) -> Unit = {},
+    onStopVpn: () -> Unit = {}
+) {
+    val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    val vpnStatus by BoxService.status.observeAsState(Status.Stopped)
+    LaunchedEffect(vpnStatus) {
+        val running = vpnStatus == Status.Started || vpnStatus == Status.Starting
+        viewModel.onVpnStatusChanged(running)
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.sideEffect.collect { effect ->
+            when (effect) {
+                is SideEffect.RequestVpnPermission -> onStartVpn(viewModel.pendingConfigJson)
+                is SideEffect.StartVpn -> onStartVpn(viewModel.pendingConfigJson)
+                is SideEffect.StopVpn -> onStopVpn()
+                is SideEffect.ShowError -> snackbarHostState.showSnackbar(effect.message)
+                is SideEffect.ShowSnackbar -> snackbarHostState.showSnackbar(effect.message)
+            }
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Filled.Shield,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            text = "SBOXY",
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 4.sp
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(
+                            imageVector = Icons.Filled.Settings,
+                            contentDescription = "Настройки",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+                )
+            )
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        containerColor = MaterialTheme.colorScheme.background
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(Modifier.height(48.dp))
+
+            PowerButton(
+                running = state.vpnRunning,
+                generating = state.isGenerating || vpnStatus == Status.Starting,
+                onClick = { viewModel.onToggleVpn() }
+            )
+
+            Spacer(Modifier.height(40.dp))
+
+            StatusBlock(
+                status = vpnStatus,
+                isGenerating = state.isGenerating,
+                vpnStartedAt = state.vpnStartedAt
+            )
+
+            Spacer(Modifier.height(32.dp))
+
+            val configState = state.configState
+            if (configState is ConfigState.Loaded) {
+                ServerInfoCard(
+                    serverName = configState.serverInfo.serverName,
+                    protocol = configState.serverInfo.protocol
+                )
+            } else {
+                Text(
+                    text = "Конфигурация не загружена",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(16.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PowerButton(
+    running: Boolean,
+    generating: Boolean,
+    onClick: () -> Unit
+) {
+    val primary = MaterialTheme.colorScheme.primary
+    val surfaceContainer = MaterialTheme.colorScheme.surfaceContainer
+    val outline = MaterialTheme.colorScheme.outlineVariant
+
+    val transition = rememberInfiniteTransition(label = "pulse")
+    val pulseAlpha by transition.animateFloat(
+        initialValue = 0.15f,
+        targetValue = 0.35f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulseAlpha"
+    )
+
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = Modifier.size(260.dp)
+    ) {
+        if (running) {
+            Box(
+                modifier = Modifier
+                    .size(260.dp)
+                    .background(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                primary.copy(alpha = pulseAlpha),
+                                Color.Transparent
+                            )
+                        ),
+                        shape = CircleShape
+                    )
+            )
+        }
+        Box(
+            modifier = Modifier
+                .size(220.dp)
+                .shadow(
+                    elevation = if (running) 24.dp else 0.dp,
+                    shape = CircleShape,
+                    ambientColor = primary,
+                    spotColor = primary
+                )
+                .clickable(onClick = onClick)
+                .background(
+                    brush = if (running) {
+                        Brush.linearGradient(
+                            colors = listOf(primary, MaterialTheme.colorScheme.primaryContainer)
+                        )
+                    } else {
+                        Brush.linearGradient(
+                            colors = listOf(
+                                outline.copy(alpha = 0.4f),
+                                outline.copy(alpha = 0.2f)
+                            )
+                        )
+                    },
+                    shape = CircleShape
+                )
+                .padding(4.dp)
+                .background(surfaceContainer, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(180.dp)
+                    .border(
+                        width = 1.dp,
+                        color = outline.copy(alpha = 0.3f),
+                        shape = CircleShape
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                if (generating) {
+                    CircularProgressIndicator(
+                        color = primary,
+                        strokeWidth = 4.dp,
+                        modifier = Modifier.size(64.dp)
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.PowerSettingsNew,
+                        contentDescription = if (running) "Выключить" else "Включить",
+                        tint = if (running) primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(96.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusBlock(
+    status: Status,
+    isGenerating: Boolean,
+    vpnStartedAt: Long?
+) {
+    val (label, color) = when {
+        isGenerating || status == Status.Starting -> "ПОДКЛЮЧЕНИЕ" to MaterialTheme.colorScheme.tertiary
+        status == Status.Started -> "CONNECTED" to MaterialTheme.colorScheme.primary
+        status == Status.Stopping -> "ОТКЛЮЧЕНИЕ" to MaterialTheme.colorScheme.onSurfaceVariant
+        else -> "DISCONNECTED" to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .background(color, CircleShape)
+            )
+            Text(
+                text = label,
+                color = color,
+                fontWeight = FontWeight.ExtraBold,
+                letterSpacing = 2.sp,
+                fontSize = 14.sp
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+
+        if (status == Status.Started && vpnStartedAt != null) {
+            UptimeText(startedAt = vpnStartedAt)
+        } else {
+            Text(
+                text = "00:00:00",
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 40.sp,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+            )
+        }
+    }
+}
+
+@Composable
+private fun UptimeText(startedAt: Long) {
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(startedAt) {
+        while (true) {
+            now = System.currentTimeMillis()
+            delay(1000)
+        }
+    }
+    val elapsed = ((now - startedAt) / 1000).coerceAtLeast(0)
+    val hours = elapsed / 3600
+    val minutes = (elapsed % 3600) / 60
+    val seconds = elapsed % 60
+    Text(
+        text = "%02d:%02d:%02d".format(hours, minutes, seconds),
+        fontWeight = FontWeight.ExtraBold,
+        fontSize = 40.sp,
+        color = MaterialTheme.colorScheme.onSurface
+    )
+}
+
+@Composable
+private fun ServerInfoCard(
+    serverName: String,
+    protocol: String
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.padding(end = 12.dp)) {
+                Text(
+                    text = "СЕРВЕР",
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    letterSpacing = 1.5.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = serverName,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = protocol.uppercase(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .background(
+                        MaterialTheme.colorScheme.surfaceContainerHighest,
+                        CircleShape
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Public,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
