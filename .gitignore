@@ -15,6 +15,7 @@ build/
 
 # Local config
 local.properties
+signing.properties
 
 # Android
 *.apk

@@ -30,12 +30,22 @@ android {
 
     signingConfigs {
         create("release") {
-            val ksFile = System.getenv("KEYSTORE_FILE")
+            // Read from env (CI) or signing.properties (local)
+            val signingProps = rootProject.file("signing.properties")
+                .takeIf { it.exists() }
+                ?.readLines()
+                ?.filter { it.contains("=") }
+                ?.associate { it.substringBefore("=").trim() to it.substringAfter("=").trim() }
+                ?: emptyMap()
+
+            fun prop(key: String): String? = System.getenv(key) ?: signingProps[key]
+
+            val ksFile = prop("KEYSTORE_FILE")
             if (!ksFile.isNullOrEmpty()) {
                 storeFile = file(ksFile)
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("KEY_ALIAS")
-                keyPassword = System.getenv("KEY_PASSWORD")
+                storePassword = prop("KEYSTORE_PASSWORD")
+                keyAlias = prop("KEY_ALIAS")
+                keyPassword = prop("KEY_PASSWORD")
             }
         }
     }
@@ -47,7 +57,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = if (!System.getenv("KEYSTORE_FILE").isNullOrEmpty()) {
+            val hasSigningConfig = !System.getenv("KEYSTORE_FILE").isNullOrEmpty() ||
+                rootProject.file("signing.properties").exists()
+            signingConfig = if (hasSigningConfig) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")
