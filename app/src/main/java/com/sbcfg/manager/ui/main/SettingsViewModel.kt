@@ -3,8 +3,12 @@ package com.sbcfg.manager.ui.main
 import android.app.Application
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.sbcfg.manager.BuildConfig
 import com.sbcfg.manager.data.preferences.AppPreferences
 import com.sbcfg.manager.domain.ConfigManager
+import com.sbcfg.manager.update.UpdateInfo
+import com.sbcfg.manager.update.UpdateManager
+import com.sbcfg.manager.update.UpdateState
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,6 +23,7 @@ import javax.inject.Inject
 class SettingsViewModel @Inject constructor(
     private val configManager: ConfigManager,
     private val appPreferences: AppPreferences,
+    private val updateManager: UpdateManager,
     private val app: Application
 ) : ViewModel() {
 
@@ -26,7 +31,9 @@ class SettingsViewModel @Inject constructor(
         val configUrl: String? = null,
         val isRefreshing: Boolean = false,
         val autoStart: Boolean = false,
-        val message: String? = null
+        val message: String? = null,
+        val currentVersion: String = BuildConfig.VERSION_NAME,
+        val updateState: UpdateState = UpdateState.Idle
     )
 
     private val _uiState = MutableStateFlow(UiState())
@@ -44,6 +51,11 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             appPreferences.autoStart.collect { enabled ->
                 _uiState.update { it.copy(autoStart = enabled) }
+            }
+        }
+        viewModelScope.launch {
+            updateManager.state.collect { updateState ->
+                _uiState.update { it.copy(updateState = updateState) }
             }
         }
     }
@@ -78,5 +90,25 @@ class SettingsViewModel @Inject constructor(
                 _sideEffect.send(SideEffect.ShowError(e.message ?: "Ошибка экспорта"))
             }
         }
+    }
+
+    fun onCheckUpdate() {
+        viewModelScope.launch {
+            updateManager.checkForUpdate()
+            val state = updateManager.state.value
+            if (state is UpdateState.Idle) {
+                _sideEffect.send(SideEffect.ShowSnackbar("Обновлений нет"))
+            }
+        }
+    }
+
+    fun onDownloadUpdate(info: UpdateInfo) {
+        viewModelScope.launch {
+            updateManager.downloadAndInstall(info)
+        }
+    }
+
+    fun onDismissUpdateError() {
+        updateManager.resetState()
     }
 }

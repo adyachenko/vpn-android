@@ -35,4 +35,7 @@ interface AppRuleDao {
 
     @Query("DELETE FROM app_rules WHERE isFromServer = 1")
     suspend fun deleteAllServerRules()
+
+    @Query("SELECT EXISTS(SELECT 1 FROM app_rules WHERE packageName = :packageName AND isFromServer = 0)")
+    suspend fun existsUserRule(packageName: String): Boolean
 }

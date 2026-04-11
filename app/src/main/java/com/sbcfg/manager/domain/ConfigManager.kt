@@ -244,14 +244,17 @@ class ConfigManager @Inject constructor(
             if (includePackage != null) {
                 for (j in 0 until includePackage.length()) {
                     val pkg = includePackage.getString(j)
-                    appRuleDao.upsert(
-                        AppRuleEntity(
-                            packageName = pkg,
-                            appName = pkg,
-                            mode = "direct",
-                            isFromServer = true
+                    // Skip if user already has a rule for this package
+                    if (!appRuleDao.existsUserRule(pkg)) {
+                        appRuleDao.upsert(
+                            AppRuleEntity(
+                                packageName = pkg,
+                                appName = pkg,
+                                mode = "direct",
+                                isFromServer = true
+                            )
                         )
-                    )
+                    }
                 }
             }
             break

@@ -11,7 +11,8 @@ import com.sbcfg.manager.data.local.entity.ServerConfigEntity
 
 @Database(
     entities = [ServerConfigEntity::class, CustomDomainEntity::class, AppRuleEntity::class],
-    version = 1
+    version = 1,
+    exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun serverConfigDao(): ServerConfigDao
