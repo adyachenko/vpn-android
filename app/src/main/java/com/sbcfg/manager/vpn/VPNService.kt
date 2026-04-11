@@ -211,6 +211,7 @@ class VPNService : VpnService(), PlatformInterface {
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
         val monitor = DefaultNetworkMonitor(getConnectivityManager())
+        monitor.onNetworkChanged = { BoxService.onNetworkChanged() }
         defaultNetworkMonitor = monitor
         monitor.start(listener)
     }

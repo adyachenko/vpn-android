@@ -1,5 +1,6 @@
 package com.sbcfg.manager.vpn
 
+import android.annotation.SuppressLint
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -21,6 +22,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+// BoxService is a process-scoped singleton that coordinates the VPN lifecycle.
+// Context references (service, vpnService, notification) are always nulled out in
+// onServiceDestroy() and stop(), so there is no actual leak.
+@SuppressLint("StaticFieldLeak")
 object BoxService : CommandServerHandler {
 
     private const val TAG = "BoxService"
@@ -45,6 +50,15 @@ object BoxService : CommandServerHandler {
     private var binder: ServiceBinder? = null
     private var healthCheck: VpnHealthCheck? = null
     private var healthScope: CoroutineScope? = null
+
+    @Volatile
+    private var lastConnectivityRestart: Long = 0
+    private const val MIN_RESTART_INTERVAL_MS = 60_000L
+
+    @Volatile
+    private var lastNetworkReload: Long = 0
+    private const val MIN_RELOAD_INTERVAL_MS = 10_000L
+    private const val NETWORK_CHANGE_RELOAD_DELAY_MS = 3_000L
 
     fun start(context: Context, configContent: String) {
         AppLog.i(TAG, "start() called, current status=${status.value}")
@@ -239,7 +253,10 @@ object BoxService : CommandServerHandler {
         stopHealthCheck()
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         healthScope = scope
-        healthCheck = VpnHealthCheck(onUnhealthy = ::onVpnUnhealthy).also {
+        healthCheck = VpnHealthCheck(
+            onUnhealthy = ::onVpnUnhealthy,
+            onConnectivityLost = ::onConnectivityLost
+        ).also {
             it.start(scope)
         }
     }
@@ -249,6 +266,58 @@ object BoxService : CommandServerHandler {
         healthCheck = null
         healthScope?.cancel()
         healthScope = null
+    }
+
+    /**
+     * Called by DefaultNetworkMonitor when the active network switches
+     * (wifi↔mobile, reconnect after sleep). Proactively reloads sing-box
+     * to refresh outbound connections and DNS, then schedules a DNS check.
+     */
+    internal fun onNetworkChanged() {
+        if (status.value != Status.Started) return
+        val now = System.currentTimeMillis()
+        if (now - lastNetworkReload < MIN_RELOAD_INTERVAL_MS) {
+            AppLog.d(TAG, "Skipping network change reload — too soon")
+            return
+        }
+        lastNetworkReload = now
+
+        GlobalScope.launch(Dispatchers.IO) {
+            delay(NETWORK_CHANGE_RELOAD_DELAY_MS)
+            if (status.value != Status.Started) return@launch
+
+            AppLog.i(TAG, "Network changed — reloading sing-box to refresh connections")
+            val config = configContent ?: return@launch
+            try {
+                val overrideOptions = OverrideOptions()
+                commandServer?.startOrReloadService(config, overrideOptions)
+                AppLog.i(TAG, "Sing-box reloaded after network change")
+            } catch (e: Exception) {
+                AppLog.e(TAG, "Reload after network change failed", e)
+            }
+
+            val scope = healthScope ?: return@launch
+            healthCheck?.onNetworkChanged(scope)
+        }
+    }
+
+    /**
+     * Called when DNS connectivity check fails repeatedly.
+     * Does a full VPN restart (stop + start) since reload alone
+     * may not fix broken DNS routing after network transitions.
+     */
+    private fun onConnectivityLost() {
+        val now = System.currentTimeMillis()
+        if (now - lastConnectivityRestart < MIN_RESTART_INTERVAL_MS) {
+            AppLog.w(TAG, "Skipping connectivity restart — last restart was ${(now - lastConnectivityRestart) / 1000}s ago")
+            return
+        }
+        lastConnectivityRestart = now
+
+        val ctx = vpnService ?: return
+        val config = configContent ?: return
+        AppLog.e(TAG, "DNS connectivity lost — full VPN restart")
+        restart(ctx, config)
     }
 
     private fun onVpnUnhealthy() {

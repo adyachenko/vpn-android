@@ -22,13 +22,21 @@ class DefaultNetworkMonitor(
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var defaultNetwork: Network? = null
 
+    /** Called when the active network changes (wifi↔mobile, reconnect after sleep). */
+    var onNetworkChanged: (() -> Unit)? = null
+
     fun start(listener: InterfaceUpdateListener) {
         this.listener = listener
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                val previousNetwork = defaultNetwork
                 defaultNetwork = network
                 checkDefaultInterfaceUpdate(network)
+                if (previousNetwork != null && previousNetwork != network) {
+                    AppLog.i(TAG, "Network switched — notifying")
+                    onNetworkChanged?.invoke()
+                }
             }
 
             override fun onCapabilitiesChanged(
@@ -60,16 +68,11 @@ class DefaultNetworkMonitor(
 
         // Use requestNetwork (not registerNetworkCallback) to get the actual default network
         // registerDefaultNetworkCallback returns VPN on Android P+
-        when {
-            Build.VERSION.SDK_INT >= 31 -> {
-                connectivity.registerBestMatchingNetworkCallback(request, callback, mainHandler)
-            }
-            Build.VERSION.SDK_INT >= 28 -> {
-                connectivity.requestNetwork(request, callback, mainHandler)
-            }
-            else -> {
-                connectivity.requestNetwork(request, callback)
-            }
+        if (Build.VERSION.SDK_INT >= 31) {
+            connectivity.registerBestMatchingNetworkCallback(request, callback, mainHandler)
+        } else {
+            // minSdk = 28, so API 28–30: requestNetwork with Handler
+            connectivity.requestNetwork(request, callback, mainHandler)
         }
 
         // Fire initial update with active network
