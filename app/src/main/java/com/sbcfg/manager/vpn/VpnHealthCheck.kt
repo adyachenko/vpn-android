@@ -44,6 +44,9 @@ class VpnHealthCheck(
     private var networkCheckJob: Job? = null
     private var dnsFailures = 0
 
+    @Volatile
+    private var lastSelectedOutbound: String? = null
+
     fun start(scope: CoroutineScope) {
         stop()
         job = scope.launch(Dispatchers.IO) {
@@ -133,12 +136,22 @@ class VpnHealthCheck(
 
     private fun ping(): Boolean {
         var client: CommandClient? = null
+        val handler = GroupAwareHandler()
         return try {
             val options = CommandClientOptions().apply {
                 statusInterval = CHECK_INTERVAL_MS
             }
-            client = CommandClient(SilentClientHandler, options)
+            client = CommandClient(handler, options)
             client.connect()
+
+            handler.selectedOutbound?.let { selected ->
+                val prev = lastSelectedOutbound
+                if (prev != null && prev != selected) {
+                    AppLog.i(TAG, "Outbound switched: $prev -> $selected")
+                }
+                lastSelectedOutbound = selected
+            }
+
             true
         } catch (e: Exception) {
             AppLog.w(TAG, "Ping failed: ${e.message}")
@@ -151,7 +164,29 @@ class VpnHealthCheck(
         }
     }
 
-    private object SilentClientHandler : CommandClientHandler {
+    private inner class GroupAwareHandler : CommandClientHandler {
+        @Volatile
+        var selectedOutbound: String? = null
+
+        override fun writeGroups(groups: OutboundGroupIterator?) {
+            if (groups == null) return
+            while (groups.hasNext()) {
+                val group = groups.next()
+                if (group.type != "urltest" && group.type != "selector") continue
+
+                selectedOutbound = group.selected
+
+                val items = mutableListOf<String>()
+                val itemIter = group.items
+                while (itemIter.hasNext()) {
+                    val item = itemIter.next()
+                    val delay = if (item.urlTestDelay > 0) "${item.urlTestDelay}ms" else "timeout"
+                    items.add("${item.tag}=$delay")
+                }
+                AppLog.d(TAG, "Outbound [${group.tag}]: selected=${group.selected}, ${items.joinToString()}")
+            }
+        }
+
         override fun clearLogs() {}
         override fun connected() {}
         override fun disconnected(message: String?) {}
@@ -159,7 +194,6 @@ class VpnHealthCheck(
         override fun setDefaultLogLevel(level: Int) {}
         override fun updateClashMode(mode: String?) {}
         override fun writeConnectionEvents(events: ConnectionEvents?) {}
-        override fun writeGroups(groups: OutboundGroupIterator?) {}
         override fun writeLogs(logs: LogIterator?) {}
         override fun writeStatus(status: StatusMessage?) {}
     }
