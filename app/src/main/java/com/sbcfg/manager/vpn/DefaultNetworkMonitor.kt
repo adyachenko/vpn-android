@@ -22,19 +22,32 @@ class DefaultNetworkMonitor(
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var defaultNetwork: Network? = null
 
+    // Skip the first onAvailable callback: it's the baseline, not a change.
+    // Any subsequent onAvailable (including after onLost→recovery) IS a change
+    // that must trigger outbound socket rebind.
+    private var initialized = false
+
     /** Called when the active network changes (wifi↔mobile, reconnect after sleep). */
     var onNetworkChanged: (() -> Unit)? = null
 
     fun start(listener: InterfaceUpdateListener) {
         this.listener = listener
+        this.initialized = false
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 val previousNetwork = defaultNetwork
                 defaultNetwork = network
                 checkDefaultInterfaceUpdate(network)
-                if (previousNetwork != null && previousNetwork != network) {
-                    AppLog.i(TAG, "Network switched — notifying")
+
+                if (!initialized) {
+                    initialized = true
+                    AppLog.d(TAG, "Initial default network observed: $network")
+                    return
+                }
+
+                if (previousNetwork != network) {
+                    AppLog.i(TAG, "Default network changed ($previousNetwork -> $network) — notifying")
                     onNetworkChanged?.invoke()
                 }
             }
@@ -89,6 +102,7 @@ class DefaultNetworkMonitor(
         networkCallback = null
         listener = null
         defaultNetwork = null
+        initialized = false
     }
 
     private fun checkDefaultInterfaceUpdate(network: Network) {

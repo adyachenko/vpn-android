@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
 import android.os.IBinder
 import androidx.lifecycle.MutableLiveData
 import com.sbcfg.manager.constant.Alert
@@ -56,9 +57,11 @@ object BoxService : CommandServerHandler {
     private const val MIN_RESTART_INTERVAL_MS = 60_000L
 
     @Volatile
-    private var lastNetworkReload: Long = 0
-    private const val MIN_RELOAD_INTERVAL_MS = 10_000L
-    private const val NETWORK_CHANGE_RELOAD_DELAY_MS = 3_000L
+    private var lastNetworkRestart: Long = 0
+    // Throttle network-change restarts: avoid restart storm during fast wifi/cellular handoffs.
+    private const val MIN_NETWORK_RESTART_INTERVAL_MS = 15_000L
+    // Wait a bit after network change before acting so the new link stabilises (DHCP, RA, DNS).
+    private const val NETWORK_CHANGE_RESTART_DELAY_MS = 2_500L
 
     fun start(context: Context, configContent: String) {
         AppLog.i(TAG, "start() called, current status=${status.value}")
@@ -251,9 +254,12 @@ object BoxService : CommandServerHandler {
 
     private fun startHealthCheck() {
         stopHealthCheck()
+        val svc = vpnService ?: return
+        val cm = svc.getSystemService(ConnectivityManager::class.java) ?: return
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         healthScope = scope
         healthCheck = VpnHealthCheck(
+            connectivityManager = cm,
             onUnhealthy = ::onVpnUnhealthy,
             onConnectivityLost = ::onConnectivityLost
         ).also {
@@ -270,41 +276,38 @@ object BoxService : CommandServerHandler {
 
     /**
      * Called by DefaultNetworkMonitor when the active network switches
-     * (wifi↔mobile, reconnect after sleep). Proactively reloads sing-box
-     * to refresh outbound connections and DNS, then schedules a DNS check.
+     * (wifi↔mobile, reconnect after sleep/wifi flap). Performs a full VPN
+     * restart: sing-box `reload` alone is not enough because Hysteria2's
+     * UDP socket stays bound to the old underlying interface address and
+     * silently black-holes packets. Only recreating outbound sockets via
+     * stop→start reliably recovers the tunnel.
      */
     internal fun onNetworkChanged() {
         if (status.value != Status.Started) return
         val now = System.currentTimeMillis()
-        if (now - lastNetworkReload < MIN_RELOAD_INTERVAL_MS) {
-            AppLog.d(TAG, "Skipping network change reload — too soon")
+        if (now - lastNetworkRestart < MIN_NETWORK_RESTART_INTERVAL_MS) {
+            AppLog.d(TAG, "Skipping network-change restart — too soon since last one")
             return
         }
-        lastNetworkReload = now
+        lastNetworkRestart = now
 
         GlobalScope.launch(Dispatchers.IO) {
-            delay(NETWORK_CHANGE_RELOAD_DELAY_MS)
+            delay(NETWORK_CHANGE_RESTART_DELAY_MS)
             if (status.value != Status.Started) return@launch
 
-            AppLog.i(TAG, "Network changed — reloading sing-box to refresh connections")
+            val ctx = vpnService ?: return@launch
             val config = configContent ?: return@launch
-            try {
-                val overrideOptions = OverrideOptions()
-                commandServer?.startOrReloadService(config, overrideOptions)
-                AppLog.i(TAG, "Sing-box reloaded after network change")
-            } catch (e: Exception) {
-                AppLog.e(TAG, "Reload after network change failed", e)
+            AppLog.i(TAG, "Network changed — restarting VPN to rebind outbound sockets")
+            withContext(Dispatchers.Main) {
+                restart(ctx, config)
             }
-
-            val scope = healthScope ?: return@launch
-            healthCheck?.onNetworkChanged(scope)
         }
     }
 
     /**
-     * Called when DNS connectivity check fails repeatedly.
-     * Does a full VPN restart (stop + start) since reload alone
-     * may not fix broken DNS routing after network transitions.
+     * Called when the tunnel connectivity probe (real HTTP request through
+     * the VPN network) fails repeatedly. Does a full VPN restart because a
+     * dead Hysteria2 UDP outbound is only recoverable by rebinding sockets.
      */
     private fun onConnectivityLost() {
         val now = System.currentTimeMillis()
@@ -316,8 +319,10 @@ object BoxService : CommandServerHandler {
 
         val ctx = vpnService ?: return
         val config = configContent ?: return
-        AppLog.e(TAG, "DNS connectivity lost — full VPN restart")
-        restart(ctx, config)
+        AppLog.e(TAG, "Tunnel connectivity lost — full VPN restart")
+        GlobalScope.launch(Dispatchers.Main) {
+            restart(ctx, config)
+        }
     }
 
     private fun onVpnUnhealthy() {
