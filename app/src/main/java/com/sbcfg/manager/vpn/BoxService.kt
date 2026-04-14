@@ -97,13 +97,12 @@ object BoxService : CommandServerHandler {
         status.postValue(Status.Stopping)
         AppLog.i(TAG, "Status set to Stopping")
         stopHealthCheck()
-        notification?.close()
         GlobalScope.launch(Dispatchers.IO) {
             // 1. Close TUN fd
             vpnService?.closeTun()
             AppLog.i(TAG, "TUN closed")
 
-            // 2. Stop sing-box engine
+            // 2. Stop sing-box engine (releases dup'd TUN fd)
             try {
                 commandServer?.closeService()
                 AppLog.i(TAG, "closeService() done")
@@ -119,7 +118,16 @@ object BoxService : CommandServerHandler {
                 AppLog.e(TAG, "CommandServer close error", e)
             }
 
-            // 4. Stop Android service
+            // 4. Remove foreground notification only after engine is fully stopped.
+            // Moving this after closeService() is critical: stopForeground() drops
+            // the service priority, and without a foreground Activity (e.g. when
+            // stopping from the QS tile) the system may kill the process before the
+            // engine releases its dup'd TUN fd — leaving the VPN icon stuck.
+            withContext(Dispatchers.Main) {
+                notification?.close()
+            }
+
+            // 5. Stop Android service
             withContext(Dispatchers.Main) {
                 AppLog.i(TAG, "stopSelf()")
                 startedAt = null
@@ -239,6 +247,9 @@ object BoxService : CommandServerHandler {
     internal fun onServiceDestroy() {
         AppLog.i(TAG, "onServiceDestroy()")
         stopHealthCheck()
+        try {
+            commandServer?.closeService()
+        } catch (_: Exception) {}
         try {
             commandServer?.close()
         } catch (_: Exception) {}
