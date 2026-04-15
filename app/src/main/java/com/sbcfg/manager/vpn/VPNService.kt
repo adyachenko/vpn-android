@@ -42,15 +42,19 @@ class VPNService : VpnService(), PlatformInterface {
         // restart. SCREEN_ON is a protected system broadcast.
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == Intent.ACTION_SCREEN_ON) {
-                    BoxService.onScreenOn()
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_ON -> BoxService.onScreenOn()
+                    Intent.ACTION_SCREEN_OFF -> BoxService.onScreenOff()
                 }
             }
         }
-        val filter = IntentFilter(Intent.ACTION_SCREEN_ON)
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
         ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         screenReceiver = receiver
-        AppLog.i(TAG, "Screen-on receiver registered")
+        AppLog.i(TAG, "Screen receiver registered (on+off)")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

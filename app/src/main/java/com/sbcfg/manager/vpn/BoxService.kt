@@ -327,6 +327,15 @@ object BoxService : CommandServerHandler {
     }
 
     /**
+     * Called by VPNService when ACTION_SCREEN_OFF fires. Just records the
+     * timestamp so the screen-on handler can gate on sleep duration.
+     */
+    internal fun onScreenOff() {
+        if (status.value != Status.Started) return
+        healthCheck?.onScreenOff()
+    }
+
+    /**
      * Called when the tunnel connectivity probe (real HTTP request through
      * the VPN network) fails repeatedly. Does a full VPN restart because a
      * dead Hysteria2 UDP outbound is only recoverable by rebinding sockets.

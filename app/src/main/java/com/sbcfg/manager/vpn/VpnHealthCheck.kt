@@ -72,8 +72,13 @@ class VpnHealthCheck(
         private const val HYSTERIA_TAG = "hysteria2-out"
         private const val NETWORK_CHANGE_CHECK_DELAY_MS = 10_000L
         // Time to wait after forcing a urltest before reading new delays.
-        // Sing-box probes outbounds sequentially with ~5s per-probe timeout.
-        private const val WAKE_URLTEST_WAIT_MS = 5_000L
+        // Sing-box probes outbounds sequentially with ~5s per-probe timeout —
+        // two outbounds + safety buffer.
+        private const val WAKE_URLTEST_WAIT_MS = 12_000L
+        // Only drop stale connections if the screen was off long enough that
+        // the Hysteria2 QUIC session likely outlived its NAT binding. Below
+        // this threshold, ripping apps' sockets would be pure noise.
+        private const val WAKE_RESET_THRESHOLD_MS = 90_000L
     }
 
     private var job: Job? = null
@@ -82,6 +87,9 @@ class VpnHealthCheck(
 
     @Volatile
     private var lastSelectorSelected: String? = null
+
+    @Volatile
+    private var lastScreenOffAt: Long = 0L
 
     fun start(scope: CoroutineScope) {
         stop()
@@ -147,13 +155,30 @@ class VpnHealthCheck(
     }
 
     /**
+     * Called on screen-off. We record the timestamp so onWakeFromSleep can
+     * decide whether the screen was off long enough for the QUIC NAT binding
+     * to matter (WAKE_RESET_THRESHOLD_MS).
+     */
+    fun onScreenOff() {
+        lastScreenOffAt = System.currentTimeMillis()
+    }
+
+    /**
      * Called on screen-on. Doze suspends the app's sockets, and UDP NAT
      * bindings on the path (home router / carrier CGNAT) usually expire in
      * ~30–60s of silence — long before the server's udpIdleTimeout. No
-     * onAvailable callback fires on unlock if wifi didn't flap, so the regular
-     * health check keeps reading the *cached* urlTestDelay from before sleep
-     * and reports healthy while packets black-hole. We force a fresh urltest
-     * run first, then probe: only now are the delays meaningful.
+     * onAvailable callback fires on unlock if wifi didn't flap. Worse, a
+     * fresh urlTest *reconnects* the outbound for its own probe stream, so
+     * the health check reports healthy while apps' existing TCP streams
+     * remain stranded on the dead QUIC session — TLS handshakes get reset
+     * mid-flight with ERR_CONNECTION_RESET until VPN is manually restarted.
+     *
+     * Fix: after a long enough sleep, force-close all connections inside
+     * sing-box. Apps' sockets get torn down and re-dialed through the
+     * outbound, which triggers a fresh QUIC handshake on the first new
+     * stream. Then we still urlTest + probe as a safety net so a truly
+     * dead outbound (server down) triggers a full restart within ~12s
+     * instead of waiting for the regular 30s health-check cycle.
      */
     fun onWakeFromSleep(scope: CoroutineScope) {
         // Skip if we haven't established a baseline yet — right after VPN start
@@ -161,9 +186,21 @@ class VpnHealthCheck(
         // would false-positive as "all timed out".
         if (lastSelectorSelected == null) return
 
+        val off = lastScreenOffAt
+        val sleepMs = if (off > 0L) System.currentTimeMillis() - off else 0L
+        if (sleepMs < WAKE_RESET_THRESHOLD_MS) {
+            AppLog.i(TAG, "Screen on — sleep ${sleepMs}ms < ${WAKE_RESET_THRESHOLD_MS}ms threshold, skipping")
+            return
+        }
+
         networkCheckJob?.cancel()
         networkCheckJob = scope.launch(Dispatchers.IO) {
-            AppLog.i(TAG, "Screen on — forcing urltest")
+            AppLog.i(TAG, "Screen on after ${sleepMs}ms sleep — dropping stale connections")
+            try {
+                Libbox.newStandaloneCommandClient().closeConnections()
+            } catch (e: Exception) {
+                AppLog.w(TAG, "closeConnections() failed: ${e.message}")
+            }
             try {
                 // urlTest applies to the urltest group, not the selector.
                 Libbox.newStandaloneCommandClient().urlTest(PROXY_AUTO_TAG)
@@ -188,6 +225,7 @@ class VpnHealthCheck(
         networkCheckJob?.cancel()
         networkCheckJob = null
         tunnelFailures = 0
+        lastScreenOffAt = 0L
     }
 
     private data class ProbeResult(
