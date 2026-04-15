@@ -316,6 +316,17 @@ object BoxService : CommandServerHandler {
     }
 
     /**
+     * Called by VPNService when ACTION_SCREEN_ON fires. Delegates to the
+     * health check, which forces a urltest refresh and restarts the tunnel
+     * if the cached post-Doze delays turn out to be stale.
+     */
+    internal fun onScreenOn() {
+        if (status.value != Status.Started) return
+        val scope = healthScope ?: return
+        healthCheck?.onWakeFromSleep(scope)
+    }
+
+    /**
      * Called when the tunnel connectivity probe (real HTTP request through
      * the VPN network) fails repeatedly. Does a full VPN restart because a
      * dead Hysteria2 UDP outbound is only recoverable by rebinding sockets.

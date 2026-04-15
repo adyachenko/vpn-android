@@ -23,20 +23,29 @@ import kotlinx.coroutines.launch
  * tunnel can actually route traffic, using sing-box's own urltest results as
  * the source of truth for tunnel health.
  *
+ * Topology (must match sing-box-proxy client-template):
+ *   proxy-select (selector, default=proxy-auto) ┐
+ *     ├─ proxy-auto (urltest, tolerance=600)    │  all traffic enters here
+ *     ├─ hysteria2-out                          │  via route.final / dns detour
+ *     └─ naive-out                              ┘
+ *
+ * - `proxy-auto` measures delays for both outbounds. High tolerance keeps
+ *   urltest from flipping on small latency changes.
+ * - `proxy-select` is a selector so we can *force* Hysteria2 the moment it
+ *   recovers, instead of waiting up to a full urltest cycle.
+ *
+ * Per-probe logic:
+ *   Hysteria healthy   → force selector to hysteria2-out (if not already)
+ *   Hysteria timing out, Naive healthy, selector stuck on hysteria2-out
+ *                      → revert selector to proxy-auto (urltest picks naive)
+ *   both timing out    → existing onConnectivityLost → full restart
+ *
  * Why not a direct socket probe?
  * The VPN-owning app is excluded from its own tunnel (addDisallowedApplication
- * prevents routing loops when the app fetches config / reports to Sentry / etc).
- * That exclusion also makes `Network.bindSocket()` to the VPN network fail
- * with EPERM — so we cannot send a test packet through the tunnel from this
- * process. Instead we read the urltest delays that sing-box itself measured
- * while probing outbounds: if every proxy outbound timed out on its last
- * probe, the tunnel is black-holing packets and needs a full restart to
- * rebind sockets (especially Hysteria2 UDP, which stays bound to the stale
- * underlying interface after a wifi/cellular change).
- *
- * Two failure modes:
- * - CommandClient connect/read fails → libbox engine crashed → onUnhealthy → reload
- * - urltest reports all proxy outbounds as timed out → onConnectivityLost → full restart
+ * prevents routing loops when the app fetches config / reports to Sentry).
+ * That exclusion also makes Network.bindSocket() to the VPN network fail with
+ * EPERM — so we cannot send a test packet through the tunnel from this
+ * process. We read the urltest delays that sing-box itself measured instead.
  */
 class VpnHealthCheck(
     @Suppress("unused") private val connectivityManager: ConnectivityManager,
@@ -45,19 +54,26 @@ class VpnHealthCheck(
 ) {
     companion object {
         private const val TAG = "VpnHealthCheck"
-        private const val CHECK_INTERVAL_MS = 60_000L
-        // First probe delay. urltest needs a few seconds after engine start
-        // to measure outbounds; polling before that would give false negatives.
+        // Tightened from 60s to 30s so a Hysteria recovery is acted on
+        // quickly — the whole point of the selector approach is low latency
+        // between "Hysteria is back" and "users get Hysteria".
+        private const val CHECK_INTERVAL_MS = 30_000L
+        // First probe delay. urltest interval is 1m, so delays are populated
+        // within ~10s of engine start; 30s gives a safety margin.
         private const val INITIAL_DELAY_MS = 30_000L
         // Short wait after CommandClient.connect() so libbox has time to push
         // initial group state via writeGroups() before we disconnect.
         private const val GROUP_STATE_WAIT_MS = 600L
         private const val MAX_FAILURES = 3
         private const val MAX_TUNNEL_FAILURES = 2
-        // Tag of the urltest group in the generated config. Must stay in
-        // sync with ConfigGenerator's template; see sing-box-proxy config.
+        // Must stay in sync with sing-box-proxy client-template.json.
         private const val PROXY_GROUP_TAG = "proxy-select"
+        private const val PROXY_AUTO_TAG = "proxy-auto"
+        private const val HYSTERIA_TAG = "hysteria2-out"
         private const val NETWORK_CHANGE_CHECK_DELAY_MS = 10_000L
+        // Time to wait after forcing a urltest before reading new delays.
+        // Sing-box probes outbounds sequentially with ~5s per-probe timeout.
+        private const val WAKE_URLTEST_WAIT_MS = 5_000L
     }
 
     private var job: Job? = null
@@ -65,7 +81,7 @@ class VpnHealthCheck(
     private var tunnelFailures = 0
 
     @Volatile
-    private var lastSelectedOutbound: String? = null
+    private var lastSelectorSelected: String? = null
 
     fun start(scope: CoroutineScope) {
         stop()
@@ -130,6 +146,42 @@ class VpnHealthCheck(
         }
     }
 
+    /**
+     * Called on screen-on. Doze suspends the app's sockets, and UDP NAT
+     * bindings on the path (home router / carrier CGNAT) usually expire in
+     * ~30–60s of silence — long before the server's udpIdleTimeout. No
+     * onAvailable callback fires on unlock if wifi didn't flap, so the regular
+     * health check keeps reading the *cached* urlTestDelay from before sleep
+     * and reports healthy while packets black-hole. We force a fresh urltest
+     * run first, then probe: only now are the delays meaningful.
+     */
+    fun onWakeFromSleep(scope: CoroutineScope) {
+        // Skip if we haven't established a baseline yet — right after VPN start
+        // the urltest cycle may not have populated any delays, and a probe
+        // would false-positive as "all timed out".
+        if (lastSelectorSelected == null) return
+
+        networkCheckJob?.cancel()
+        networkCheckJob = scope.launch(Dispatchers.IO) {
+            AppLog.i(TAG, "Screen on — forcing urltest")
+            try {
+                // urlTest applies to the urltest group, not the selector.
+                Libbox.newStandaloneCommandClient().urlTest(PROXY_AUTO_TAG)
+            } catch (e: Exception) {
+                AppLog.w(TAG, "Forced urlTest failed: ${e.message}")
+                return@launch
+            }
+            delay(WAKE_URLTEST_WAIT_MS)
+            val result = probe()
+            if (result.libboxAlive && !result.outboundHealthy) {
+                AppLog.e(TAG, "Post-wake: outbounds timed out — restarting VPN")
+                tunnelFailures = 0
+                runCatching { onConnectivityLost() }
+                    .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
+            }
+        }
+    }
+
     fun stop() {
         job?.cancel()
         job = null
@@ -145,9 +197,8 @@ class VpnHealthCheck(
 
     /**
      * Connects to libbox's CommandServer over the unix socket, waits briefly
-     * for an initial state push, then reads urltest delays for the proxy
-     * group. The connect itself proves libbox is alive; the delays prove
-     * whether the tunnel can actually reach the upstream.
+     * for state push, then reads both the selector's current choice and the
+     * urltest group's measured delays. Applies the Hysteria-preference policy.
      */
     private fun probe(): ProbeResult {
         var client: CommandClient? = null
@@ -173,61 +224,100 @@ class VpnHealthCheck(
 
         if (!libboxAlive) return ProbeResult(libboxAlive = false, outboundHealthy = false)
 
-        handler.selectedOutbound?.let { selected ->
-            val prev = lastSelectedOutbound
+        val selected = handler.selectorSelected
+        if (selected != null) {
+            val prev = lastSelectorSelected
             if (prev != null && prev != selected) {
-                AppLog.i(TAG, "Outbound switched: $prev -> $selected")
+                AppLog.i(TAG, "Selector switched: $prev -> $selected")
             }
-            lastSelectedOutbound = selected
+            lastSelectorSelected = selected
         }
 
-        val proxyState = handler.proxyGroupState
-        return if (proxyState == null) {
-            // No proxy urltest group seen yet — treat as healthy, don't flap.
-            // This happens in the short window between engine restart and the
-            // first urltest cycle; the next probe will have real data.
-            AppLog.i(TAG, "No proxy group state yet — assuming healthy")
-            ProbeResult(libboxAlive = true, outboundHealthy = true)
-        } else {
-            AppLog.i(TAG, "Proxy outbounds: ${proxyState.description}")
-            ProbeResult(libboxAlive = true, outboundHealthy = proxyState.hasHealthy)
+        val auto = handler.autoState
+        if (auto == null) {
+            // No urltest data yet — short window after engine start.
+            AppLog.i(TAG, "No proxy-auto state yet — assuming healthy")
+            return ProbeResult(libboxAlive = true, outboundHealthy = true)
+        }
+
+        AppLog.i(TAG, "Proxy outbounds: ${auto.description} (selector=$selected)")
+
+        applyPreferencePolicy(selected, auto)
+
+        return ProbeResult(libboxAlive = true, outboundHealthy = auto.hasHealthy)
+    }
+
+    /**
+     * Enforces "Hysteria2 first" at the selector level, bypassing urltest's
+     * tolerance for recovery events. urltest with tolerance=600 keeps us
+     * stable on Naive once the switch happens; this brings us back as soon
+     * as Hysteria2's probe succeeds.
+     */
+    private fun applyPreferencePolicy(selected: String?, auto: ProxyAutoState) {
+        selected ?: return
+        when {
+            auto.hysteriaDelay > 0 && selected != HYSTERIA_TAG -> {
+                AppLog.i(TAG, "Hysteria healthy (${auto.hysteriaDelay}ms) — forcing selector to $HYSTERIA_TAG")
+                forceSelect(HYSTERIA_TAG)
+            }
+            auto.hysteriaDelay == 0 && auto.naiveDelay > 0 && selected == HYSTERIA_TAG -> {
+                // We previously forced Hysteria; it died. Hand control back to
+                // urltest so it picks Naive (the only live outbound).
+                AppLog.i(TAG, "Hysteria down, Naive live — reverting selector to $PROXY_AUTO_TAG")
+                forceSelect(PROXY_AUTO_TAG)
+            }
         }
     }
 
-    private data class ProxyGroupState(
+    private fun forceSelect(outboundTag: String) {
+        try {
+            Libbox.newStandaloneCommandClient().selectOutbound(PROXY_GROUP_TAG, outboundTag)
+        } catch (e: Exception) {
+            AppLog.w(TAG, "selectOutbound($PROXY_GROUP_TAG, $outboundTag) failed: ${e.message}")
+        }
+    }
+
+    private data class ProxyAutoState(
+        val hysteriaDelay: Int,
+        val naiveDelay: Int,
         val hasHealthy: Boolean,
         val description: String
     )
 
     private inner class GroupAwareHandler : CommandClientHandler {
         @Volatile
-        var selectedOutbound: String? = null
+        var selectorSelected: String? = null
 
         @Volatile
-        var proxyGroupState: ProxyGroupState? = null
+        var autoState: ProxyAutoState? = null
 
         override fun writeGroups(groups: OutboundGroupIterator?) {
             if (groups == null) return
             while (groups.hasNext()) {
                 val group = groups.next()
-                if (group.type != "urltest" && group.type != "selector") continue
-
-                val items = mutableListOf<String>()
-                var anyHealthy = false
-                val itemIter = group.items
-                while (itemIter.hasNext()) {
-                    val item = itemIter.next()
-                    val d = item.urlTestDelay
-                    if (d > 0) anyHealthy = true
-                    items.add("${item.tag}=${if (d > 0) "${d}ms" else "timeout"}")
-                }
-
-                if (group.tag == PROXY_GROUP_TAG) {
-                    selectedOutbound = group.selected
-                    proxyGroupState = ProxyGroupState(
-                        hasHealthy = anyHealthy,
-                        description = "selected=${group.selected}, ${items.joinToString()}"
-                    )
+                when (group.tag) {
+                    PROXY_GROUP_TAG -> if (group.type == "selector") {
+                        selectorSelected = group.selected
+                    }
+                    PROXY_AUTO_TAG -> if (group.type == "urltest") {
+                        var hysteriaDelay = 0
+                        var naiveDelay = 0
+                        val items = mutableListOf<String>()
+                        val itemIter = group.items
+                        while (itemIter.hasNext()) {
+                            val item = itemIter.next()
+                            val d = item.urlTestDelay
+                            if (item.tag == HYSTERIA_TAG) hysteriaDelay = d
+                            else naiveDelay = d
+                            items.add("${item.tag}=${if (d > 0) "${d}ms" else "timeout"}")
+                        }
+                        autoState = ProxyAutoState(
+                            hysteriaDelay = hysteriaDelay,
+                            naiveDelay = naiveDelay,
+                            hasHealthy = hysteriaDelay > 0 || naiveDelay > 0,
+                            description = items.joinToString()
+                        )
+                    }
                 }
             }
         }

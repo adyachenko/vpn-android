@@ -1,11 +1,15 @@
 package com.sbcfg.manager.vpn
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
+import androidx.core.content.ContextCompat
 import com.sbcfg.manager.util.AppLog
 import io.nekohasekai.libbox.ConnectionOwner
 import io.nekohasekai.libbox.InterfaceUpdateListener
@@ -27,6 +31,27 @@ class VPNService : VpnService(), PlatformInterface {
 
     private var tunFd: ParcelFileDescriptor? = null
     private var defaultNetworkMonitor: DefaultNetworkMonitor? = null
+    private var screenReceiver: BroadcastReceiver? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        // Hysteria2 UDP dies after Doze strands the NAT binding (typically
+        // ~60s of radio silence). No network-change callback fires on unlock
+        // if wifi stayed the same, so we piggyback on ACTION_SCREEN_ON to
+        // trigger a urltest refresh and, if the tunnel is actually dead, a
+        // restart. SCREEN_ON is a protected system broadcast.
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == Intent.ACTION_SCREEN_ON) {
+                    BoxService.onScreenOn()
+                }
+            }
+        }
+        val filter = IntentFilter(Intent.ACTION_SCREEN_ON)
+        ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        screenReceiver = receiver
+        AppLog.i(TAG, "Screen-on receiver registered")
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         AppLog.i(TAG, "onStartCommand() called, hasConfig=${intent?.hasExtra("config")}")
@@ -62,6 +87,12 @@ class VPNService : VpnService(), PlatformInterface {
 
     override fun onDestroy() {
         AppLog.i(TAG, "onDestroy() called")
+        try {
+            screenReceiver?.let { unregisterReceiver(it) }
+        } catch (e: Exception) {
+            AppLog.w(TAG, "Error unregistering screen receiver: ${e.message}")
+        }
+        screenReceiver = null
         closeTun()
         BoxService.onServiceDestroy()
         super.onDestroy()
