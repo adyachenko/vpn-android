@@ -22,6 +22,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 // BoxService is a process-scoped singleton that coordinates the VPN lifecycle.
 // Context references (service, vpnService, notification) are always nulled out in
@@ -63,6 +64,15 @@ object BoxService : CommandServerHandler {
     // Wait a bit after network change before acting so the new link stabilises (DHCP, RA, DNS).
     private const val NETWORK_CHANGE_RESTART_DELAY_MS = 2_500L
 
+    // restart() waits this long for the engine to finish stopping before
+    // forcing a reset. Hysteria2 QUIC outbounds can take >10s to close cleanly
+    // on network change, so we keep a generous budget.
+    private const val RESTART_STOP_TIMEOUT_MS = 30_000L
+    // Hard cap on libbox closeService(). The Go call cannot be cancelled, but
+    // we can stop blocking the Kotlin side and let the goroutine finish in the
+    // background while we move Status to Stopped.
+    private const val CLOSE_SERVICE_TIMEOUT_MS = 10_000L
+
     fun start(context: Context, configContent: String) {
         AppLog.i(TAG, "start() called, current status=${status.value}")
         if (status.value == Status.Starting || status.value == Status.Started) {
@@ -102,10 +112,22 @@ object BoxService : CommandServerHandler {
             vpnService?.closeTun()
             AppLog.i(TAG, "TUN closed")
 
-            // 2. Stop sing-box engine (releases dup'd TUN fd)
+            // 2. Stop sing-box engine (releases dup'd TUN fd).
+            // closeService() is a blocking Go call that may hang on QUIC/Hysteria2
+            // outbound shutdown. We can't cancel it, but withTimeoutOrNull lets the
+            // Kotlin side move on — the goroutine will finish asynchronously.
             try {
-                commandServer?.closeService()
-                AppLog.i(TAG, "closeService() done")
+                val t0 = System.currentTimeMillis()
+                val completed = withTimeoutOrNull(CLOSE_SERVICE_TIMEOUT_MS) {
+                    commandServer?.closeService()
+                    true
+                }
+                val dt = System.currentTimeMillis() - t0
+                if (completed == null) {
+                    AppLog.w(TAG, "closeService() did not finish within ${CLOSE_SERVICE_TIMEOUT_MS}ms — proceeding anyway (goroutine may still run)")
+                } else {
+                    AppLog.i(TAG, "closeService() done in ${dt}ms")
+                }
             } catch (e: Exception) {
                 AppLog.e(TAG, "closeService() error", e)
             }
@@ -165,18 +187,39 @@ object BoxService : CommandServerHandler {
         GlobalScope.launch(Dispatchers.Main) {
             stop()
             // Wait for the engine to actually shut down before re-creating it.
-            val deadline = System.currentTimeMillis() + 5000
+            val deadline = System.currentTimeMillis() + RESTART_STOP_TIMEOUT_MS
             while (status.value != Status.Stopped && System.currentTimeMillis() < deadline) {
                 delay(100)
             }
             if (status.value != Status.Stopped) {
-                AppLog.w(TAG, "restart() timed out waiting for stop")
-                return@launch
+                // Engine still shutting down (QUIC/Hysteria2 hang). Rather than give
+                // up and leave VPN off, force a reset and proceed with start(). The
+                // old Go goroutine will finish in the background; the new run creates
+                // a fresh CommandServer and VPNService instance.
+                AppLog.w(TAG, "restart() timed out after ${RESTART_STOP_TIMEOUT_MS}ms — forcing reset and proceeding")
+                forceResetForRestart()
             }
             delay(300)
             start(context, newConfig)
             AppLog.i(TAG, "restart() completed")
         }
+    }
+
+    /**
+     * Force-reset singleton state when the engine fails to stop within the
+     * restart deadline. Drops references without calling close() again — the
+     * original closeService() coroutine in stop() is still running and will
+     * finish asynchronously. Safe because start() always creates a fresh
+     * CommandServer and the Android service lifecycle is reset via stopSelf().
+     */
+    private fun forceResetForRestart() {
+        commandServer = null
+        service = null
+        vpnService = null
+        notification = null
+        binder = null
+        startedAt = null
+        status.postValue(Status.Stopped)
     }
 
     // Called from VPNService.onStartCommand
