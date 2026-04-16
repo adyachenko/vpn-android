@@ -25,6 +25,7 @@ import com.sbcfg.manager.ui.theme.SbcfgTheme
 import com.sbcfg.manager.util.AppLog
 import com.sbcfg.manager.vpn.BoxService
 import com.sbcfg.manager.vpn.ServiceConnection
+import com.sbcfg.manager.worker.UpdateCheckWorker
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
 
@@ -57,6 +58,7 @@ class MainActivity : ComponentActivity() {
 
     private var serviceConnection: ServiceConnection? = null
     private val pendingDeepLinkUrl: MutableState<String?> = mutableStateOf(null)
+    private val pendingOpenUpdateCheck: MutableState<Boolean> = mutableStateOf(false)
 
     override fun onResume() {
         super.onResume()
@@ -73,6 +75,7 @@ class MainActivity : ComponentActivity() {
 
         // Handle deep link from intent
         handleDeepLink(intent)
+        handleUpdateCheckIntent(intent)
 
         setContent {
             SbcfgTheme {
@@ -81,13 +84,15 @@ class MainActivity : ComponentActivity() {
                     val hasConfig = configManager.hasConfig()
                     startDestination = when {
                         pendingDeepLinkUrl.value != null -> "setup"
+                        pendingOpenUpdateCheck.value && hasConfig -> "settings"
                         hasConfig -> "dashboard"
                         else -> "setup"
                     }
                     AppLog.i(
                         "Activity",
                         "Start destination=$startDestination (hasConfig=$hasConfig, " +
-                            "deepLink=${pendingDeepLinkUrl.value != null})"
+                            "deepLink=${pendingDeepLinkUrl.value != null}, " +
+                            "openUpdate=${pendingOpenUpdateCheck.value})"
                     )
                 }
 
@@ -96,6 +101,8 @@ class MainActivity : ComponentActivity() {
                     NavGraph(
                         startDestination = dest,
                         deepLinkUrl = pendingDeepLinkUrl.value,
+                        openUpdateCheck = pendingOpenUpdateCheck.value,
+                        onUpdateCheckConsumed = { pendingOpenUpdateCheck.value = false },
                         onStartVpn = { configJson ->
                             AppLog.i(
                                 "Activity",
@@ -117,6 +124,14 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleDeepLink(intent)
+        handleUpdateCheckIntent(intent)
+    }
+
+    private fun handleUpdateCheckIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(UpdateCheckWorker.EXTRA_OPEN_UPDATE_CHECK, false) == true) {
+            AppLog.i("Activity", "Update-check deep link — routing to settings")
+            pendingOpenUpdateCheck.value = true
+        }
     }
 
     override fun onDestroy() {

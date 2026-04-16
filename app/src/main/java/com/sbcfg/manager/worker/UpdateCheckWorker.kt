@@ -20,6 +20,7 @@ import com.sbcfg.manager.update.GitHubUpdateChecker
 import com.sbcfg.manager.util.AppLog
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
+import java.util.Calendar
 
 @HiltWorker
 class UpdateCheckWorker @AssistedInject constructor(
@@ -29,6 +30,11 @@ class UpdateCheckWorker @AssistedInject constructor(
 ) : CoroutineWorker(appContext, workerParams) {
 
     override suspend fun doWork(): Result {
+        val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        if (hour < DAYTIME_START_HOUR || hour >= DAYTIME_END_HOUR) {
+            AppLog.i(TAG, "Skipping update check (hour=$hour, outside $DAYTIME_START_HOUR..${DAYTIME_END_HOUR - 1})")
+            return Result.success()
+        }
         AppLog.i(TAG, "Starting periodic update check")
         return try {
             val updateInfo = updateChecker.check()
@@ -61,6 +67,7 @@ class UpdateCheckWorker @AssistedInject constructor(
 
         val intent = Intent(appContext, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_OPEN_UPDATE_CHECK, true)
         }
         val pendingIntent = PendingIntent.getActivity(
             appContext, 0, intent,
@@ -89,5 +96,9 @@ class UpdateCheckWorker @AssistedInject constructor(
         const val WORK_NAME = "UpdateCheck"
         private const val CHANNEL_ID = "app_updates"
         private const val NOTIFICATION_ID = 1001
+        private const val DAYTIME_START_HOUR = 8
+        private const val DAYTIME_END_HOUR = 22
+        /** Set on the MainActivity intent to deep-link to settings → update check. */
+        const val EXTRA_OPEN_UPDATE_CHECK = "open_update_check"
     }
 }

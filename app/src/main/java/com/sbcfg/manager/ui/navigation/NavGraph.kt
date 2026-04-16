@@ -15,6 +15,8 @@ fun NavGraph(
     navController: NavHostController = rememberNavController(),
     startDestination: String,
     deepLinkUrl: String? = null,
+    openUpdateCheck: Boolean = false,
+    onUpdateCheckConsumed: () -> Unit = {},
     onStartVpn: (configJson: String?) -> Unit = {},
     onStopVpn: () -> Unit = {}
 ) {
@@ -25,6 +27,16 @@ fun NavGraph(
             navController.currentDestination?.route != "setup"
         ) {
             navController.navigate("setup")
+        }
+    }
+
+    // If the update-check deep link arrives while the user is not on settings
+    // (e.g. app was already on dashboard), jump there.
+    LaunchedEffect(openUpdateCheck) {
+        if (openUpdateCheck &&
+            navController.currentDestination?.route != "settings"
+        ) {
+            navController.navigate("settings")
         }
     }
 
@@ -51,7 +63,9 @@ fun NavGraph(
         }
         composable("settings") {
             SettingsScreen(
-                onBack = { navController.popBackStack() }
+                onBack = { navController.popBackStack() },
+                openUpdateCheck = openUpdateCheck,
+                onUpdateCheckConsumed = onUpdateCheckConsumed
             )
         }
     }

@@ -50,7 +50,7 @@ class App : Application(), Configuration.Provider {
         ).setConstraints(constraints).build()
 
         val updateCheck = PeriodicWorkRequestBuilder<UpdateCheckWorker>(
-            24, TimeUnit.HOURS
+            1, TimeUnit.HOURS
         ).setConstraints(constraints).build()
 
         val workManager = WorkManager.getInstance(this)
@@ -61,10 +61,10 @@ class App : Application(), Configuration.Provider {
         )
         workManager.enqueueUniquePeriodicWork(
             UpdateCheckWorker.WORK_NAME,
-            ExistingPeriodicWorkPolicy.KEEP,
+            ExistingPeriodicWorkPolicy.UPDATE,
             updateCheck
         )
-        AppLog.i("App", "Scheduled periodic workers (config refresh + update check, 24h)")
+        AppLog.i("App", "Scheduled periodic workers (config refresh 24h, update check 1h daytime-only)")
     }
 
     private fun setupLibbox() {

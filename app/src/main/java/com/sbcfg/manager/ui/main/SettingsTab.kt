@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -45,11 +46,14 @@ import com.sbcfg.manager.update.UpdateState
 
 @Composable
 fun SettingsTab(
-    viewModel: SettingsViewModel = hiltViewModel()
+    viewModel: SettingsViewModel = hiltViewModel(),
+    triggerUpdateCheck: Boolean = false,
+    onUpdateCheckTriggered: () -> Unit = {}
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val clipboardManager = LocalClipboardManager.current
+    val listState = rememberLazyListState()
 
     LaunchedEffect(Unit) {
         viewModel.sideEffect.collect { effect ->
@@ -61,8 +65,19 @@ fun SettingsTab(
         }
     }
 
+    // Deep-link from the "new version" notification: scroll to the update card
+    // (index 5 in the static list below) and kick off a check automatically.
+    LaunchedEffect(triggerUpdateCheck) {
+        if (triggerUpdateCheck) {
+            listState.animateScrollToItem(UPDATE_CARD_INDEX)
+            viewModel.onCheckUpdate()
+            onUpdateCheckTriggered()
+        }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -415,3 +430,7 @@ fun SettingsTab(
         )
     }
 }
+
+// Keep in sync with LazyColumn order in SettingsTab:
+// 0 = URL, 1 = Refresh, 2 = Auto-start, 3 = Export, 4 = VPN engine, 5 = Update.
+private const val UPDATE_CARD_INDEX = 5

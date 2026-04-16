@@ -17,6 +17,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -31,7 +32,9 @@ import com.sbcfg.manager.ui.main.SettingsTab
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    openUpdateCheck: Boolean = false,
+    onUpdateCheckConsumed: () -> Unit = {}
 ) {
     val tabs = listOf("Общие", "Домены", "Приложения", "Логи")
     // Simple manual switching instead of HorizontalPager. On Android TV the
@@ -39,6 +42,11 @@ fun SettingsScreen(
     // from focusable children inside each tab, smoothly scrolling pages
     // sideways even with userScrollEnabled=false.
     var selectedTab by remember { mutableIntStateOf(0) }
+
+    // Force the "Общие" tab when the user arrived via the update-check deep link.
+    LaunchedEffect(openUpdateCheck) {
+        if (openUpdateCheck) selectedTab = 0
+    }
 
     Scaffold(
         topBar = {
@@ -80,7 +88,10 @@ fun SettingsScreen(
 
             Box(modifier = Modifier.fillMaxSize()) {
                 when (selectedTab) {
-                    0 -> SettingsTab()
+                    0 -> SettingsTab(
+                        triggerUpdateCheck = openUpdateCheck,
+                        onUpdateCheckTriggered = onUpdateCheckConsumed
+                    )
                     1 -> DomainsTab()
                     2 -> AppsTab()
                     3 -> LogsTab()
