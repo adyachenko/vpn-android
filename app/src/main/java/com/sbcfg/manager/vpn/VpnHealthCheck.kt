@@ -71,13 +71,9 @@ class VpnHealthCheck(
         private const val PROXY_AUTO_TAG = "proxy-auto"
         private const val HYSTERIA_TAG = "hysteria2-out"
         private const val NETWORK_CHANGE_CHECK_DELAY_MS = 10_000L
-        // Time to wait after forcing a urltest before reading new delays.
-        // Sing-box probes outbounds sequentially with ~5s per-probe timeout —
-        // two outbounds + safety buffer.
-        private const val WAKE_URLTEST_WAIT_MS = 12_000L
-        // Only drop stale connections if the screen was off long enough that
-        // the Hysteria2 QUIC session likely outlived its NAT binding. Below
-        // this threshold, ripping apps' sockets would be pure noise.
+        // Only restart VPN on wake if the screen was off long enough that the
+        // Hysteria2 QUIC session likely outlived its NAT binding. Below this
+        // threshold, ripping the tunnel would be pure noise.
         private const val WAKE_RESET_THRESHOLD_MS = 90_000L
     }
 
@@ -167,23 +163,20 @@ class VpnHealthCheck(
      * Called on screen-on. Doze suspends the app's sockets, and UDP NAT
      * bindings on the path (home router / carrier CGNAT) usually expire in
      * ~30–60s of silence — long before the server's udpIdleTimeout. No
-     * onAvailable callback fires on unlock if wifi didn't flap. Worse, a
-     * fresh urlTest *reconnects* the outbound for its own probe stream, so
-     * the health check reports healthy while apps' existing TCP streams
-     * remain stranded on the dead QUIC session — TLS handshakes get reset
-     * mid-flight with ERR_CONNECTION_RESET until VPN is manually restarted.
+     * onAvailable callback fires on unlock if wifi didn't flap.
      *
-     * Fix: after a long enough sleep, force-close all connections inside
-     * sing-box. Apps' sockets get torn down and re-dialed through the
-     * outbound, which triggers a fresh QUIC handshake on the first new
-     * stream. Then we still urlTest + probe as a safety net so a truly
-     * dead outbound (server down) triggers a full restart within ~12s
-     * instead of waiting for the regular 30s health-check cycle.
+     * Soft mitigations (closeConnections + forced urlTest) proved
+     * insufficient: Hysteria2's QUIC session is persistent and is reused by
+     * new streams, so apps' fresh TCP connections keep landing on the dead
+     * session and fail with ERR_CONNECTION_RESET while the probe stream
+     * (which happens to re-open the NAT binding) reports healthy latency.
+     *
+     * Fix: after a long enough sleep, do a full VPN restart — same path as
+     * onConnectivityLost / network change. Tears down QUIC, rebinds sockets.
      */
     fun onWakeFromSleep(scope: CoroutineScope) {
-        // Skip if we haven't established a baseline yet — right after VPN start
-        // the urltest cycle may not have populated any delays, and a probe
-        // would false-positive as "all timed out".
+        // Skip if we haven't established a baseline yet — engine may still be
+        // starting; a restart on incomplete state is wasteful.
         if (lastSelectorSelected == null) return
 
         val off = lastScreenOffAt
@@ -195,27 +188,10 @@ class VpnHealthCheck(
 
         networkCheckJob?.cancel()
         networkCheckJob = scope.launch(Dispatchers.IO) {
-            AppLog.i(TAG, "Screen on after ${sleepMs}ms sleep — dropping stale connections")
-            try {
-                Libbox.newStandaloneCommandClient().closeConnections()
-            } catch (e: Exception) {
-                AppLog.w(TAG, "closeConnections() failed: ${e.message}")
-            }
-            try {
-                // urlTest applies to the urltest group, not the selector.
-                Libbox.newStandaloneCommandClient().urlTest(PROXY_AUTO_TAG)
-            } catch (e: Exception) {
-                AppLog.w(TAG, "Forced urlTest failed: ${e.message}")
-                return@launch
-            }
-            delay(WAKE_URLTEST_WAIT_MS)
-            val result = probe()
-            if (result.libboxAlive && !result.outboundHealthy) {
-                AppLog.e(TAG, "Post-wake: outbounds timed out — restarting VPN")
-                tunnelFailures = 0
-                runCatching { onConnectivityLost() }
-                    .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
-            }
+            AppLog.i(TAG, "Screen on after ${sleepMs}ms sleep — restarting VPN")
+            tunnelFailures = 0
+            runCatching { onConnectivityLost() }
+                .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
         }
     }
 
