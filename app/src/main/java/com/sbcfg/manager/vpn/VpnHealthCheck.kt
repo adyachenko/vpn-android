@@ -54,27 +54,36 @@ class VpnHealthCheck(
 ) {
     companion object {
         private const val TAG = "VpnHealthCheck"
-        // Tightened from 60s to 30s so a Hysteria recovery is acted on
-        // quickly — the whole point of the selector approach is low latency
-        // between "Hysteria is back" and "users get Hysteria".
+        // Regular interval when everything is healthy — probes are not free
+        // (each one opens a gRPC stream and waits for a state push) so we
+        // don't want to hammer libbox.
         private const val CHECK_INTERVAL_MS = 30_000L
+        // Tight interval once we've seen a failure. Lets us either confirm a
+        // real outage within a few seconds (restart) or recover quickly from
+        // a single transient glitch.
+        private const val RETRY_INTERVAL_MS = 5_000L
         // First probe delay. urltest interval is 1m, so delays are populated
         // within ~10s of engine start; 30s gives a safety margin.
         private const val INITIAL_DELAY_MS = 30_000L
         // Short wait after CommandClient.connect() so libbox has time to push
         // initial group state via writeGroups() before we disconnect.
         private const val GROUP_STATE_WAIT_MS = 600L
-        private const val MAX_FAILURES = 3
+        private const val MAX_FAILURES = 2
         private const val MAX_TUNNEL_FAILURES = 2
         // Must stay in sync with sing-box-proxy client-template.json.
         private const val PROXY_GROUP_TAG = "proxy-select"
         private const val PROXY_AUTO_TAG = "proxy-auto"
         private const val HYSTERIA_TAG = "hysteria2-out"
         private const val NETWORK_CHANGE_CHECK_DELAY_MS = 10_000L
-        // Only restart VPN on wake if the screen was off long enough that the
-        // Hysteria2 QUIC session likely outlived its NAT binding. Below this
-        // threshold, ripping the tunnel would be pure noise.
-        private const val WAKE_RESET_THRESHOLD_MS = 90_000L
+        // After a screen-off, apps' TCP connections die and Hysteria2's QUIC
+        // session outlives its NAT binding on the path (home router / carrier
+        // CGNAT). A probe can wrongly report the tunnel healthy (the probe
+        // stream re-opens the NAT binding), while real traffic fails with
+        // ERR_CONNECTION_RESET. Only a full VPN restart rebinds sockets and
+        // tears down the stale QUIC session. 15s covers mobile CGNAT / Doze,
+        // which rip TCP sockets well before the typical 30–60s UDP timeout.
+        // Shorter risks unnecessary restarts on quick screen-peek patterns.
+        private const val WAKE_RESET_THRESHOLD_MS = 15_000L
     }
 
     private var job: Job? = null
@@ -87,46 +96,76 @@ class VpnHealthCheck(
     @Volatile
     private var lastScreenOffAt: Long = 0L
 
+    // Shared state so out-of-band probes (screen-on, network change) can
+    // participate in the same failure counter as the main loop.
+    @Volatile
+    private var failures = 0
+
+    // Signals the main loop to wake up immediately instead of sleeping out
+    // its current delay — used after an out-of-band probe so the next tick
+    // lands in line with the adaptive interval policy.
+    @Volatile
+    private var wakeSignal: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+
     fun start(scope: CoroutineScope) {
         stop()
+        failures = 0
         job = scope.launch(Dispatchers.IO) {
-            AppLog.i(TAG, "Health check started (interval=${CHECK_INTERVAL_MS}ms, threshold=$MAX_FAILURES)")
+            AppLog.i(TAG, "Health check started (interval=${CHECK_INTERVAL_MS}ms, retry=${RETRY_INTERVAL_MS}ms, threshold=$MAX_FAILURES)")
             delay(INITIAL_DELAY_MS)
-            var failures = 0
             while (isActive) {
-                val result = probe()
-                when {
-                    !result.libboxAlive -> {
-                        failures++
-                        tunnelFailures = 0
-                        AppLog.w(TAG, "Libbox ping failed ($failures/$MAX_FAILURES)")
-                        if (failures >= MAX_FAILURES) {
-                            AppLog.e(TAG, "Libbox unresponsive — reloading engine")
-                            runCatching { onUnhealthy() }
-                                .onFailure { AppLog.e(TAG, "onUnhealthy callback failed", it) }
-                            failures = 0
-                        }
-                    }
-                    !result.outboundHealthy -> {
+                handleProbeResult(probe())
+                val nextDelay = if (failures > 0 || tunnelFailures > 0) RETRY_INTERVAL_MS else CHECK_INTERVAL_MS
+                val signal = kotlinx.coroutines.CompletableDeferred<Unit>()
+                wakeSignal = signal
+                try {
+                    kotlinx.coroutines.withTimeoutOrNull(nextDelay) { signal.await() }
+                } finally {
+                    wakeSignal = null
+                }
+            }
+        }
+    }
+
+    private fun handleProbeResult(result: ProbeResult) {
+        when {
+            !result.libboxAlive -> {
+                tunnelFailures = 0
+                if (result.socketMissing) {
+                    // Command socket file is gone — CommandServer is
+                    // definitively dead. Skip retry loop, restart now.
+                    AppLog.e(TAG, "Command socket missing — triggering VPN restart immediately")
+                    failures = 0
+                    runCatching { onUnhealthy() }
+                        .onFailure { AppLog.e(TAG, "onUnhealthy callback failed", it) }
+                } else {
+                    failures++
+                    AppLog.w(TAG, "Libbox ping failed ($failures/$MAX_FAILURES)")
+                    if (failures >= MAX_FAILURES) {
+                        AppLog.e(TAG, "Libbox unresponsive — triggering VPN restart")
+                        runCatching { onUnhealthy() }
+                            .onFailure { AppLog.e(TAG, "onUnhealthy callback failed", it) }
                         failures = 0
-                        tunnelFailures++
-                        AppLog.w(TAG, "All proxy outbounds timing out ($tunnelFailures/$MAX_TUNNEL_FAILURES)")
-                        if (tunnelFailures >= MAX_TUNNEL_FAILURES) {
-                            AppLog.e(TAG, "Tunnel dead — triggering VPN restart")
-                            tunnelFailures = 0
-                            runCatching { onConnectivityLost() }
-                                .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
-                        }
-                    }
-                    else -> {
-                        if (failures > 0 || tunnelFailures > 0) {
-                            AppLog.i(TAG, "Tunnel recovered")
-                        }
-                        failures = 0
-                        tunnelFailures = 0
                     }
                 }
-                delay(CHECK_INTERVAL_MS)
+            }
+            !result.outboundHealthy -> {
+                failures = 0
+                tunnelFailures++
+                AppLog.w(TAG, "All proxy outbounds timing out ($tunnelFailures/$MAX_TUNNEL_FAILURES)")
+                if (tunnelFailures >= MAX_TUNNEL_FAILURES) {
+                    AppLog.e(TAG, "Tunnel dead — triggering VPN restart")
+                    tunnelFailures = 0
+                    runCatching { onConnectivityLost() }
+                        .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
+                }
+            }
+            else -> {
+                if (failures > 0 || tunnelFailures > 0) {
+                    AppLog.i(TAG, "Tunnel recovered")
+                }
+                failures = 0
+                tunnelFailures = 0
             }
         }
     }
@@ -160,38 +199,42 @@ class VpnHealthCheck(
     }
 
     /**
-     * Called on screen-on. Doze suspends the app's sockets, and UDP NAT
-     * bindings on the path (home router / carrier CGNAT) usually expire in
-     * ~30–60s of silence — long before the server's udpIdleTimeout. No
-     * onAvailable callback fires on unlock if wifi didn't flap.
+     * Called on screen-on. Two-branch policy:
      *
-     * Soft mitigations (closeConnections + forced urlTest) proved
-     * insufficient: Hysteria2's QUIC session is persistent and is reused by
-     * new streams, so apps' fresh TCP connections keep landing on the dead
-     * session and fail with ERR_CONNECTION_RESET while the probe stream
-     * (which happens to re-open the NAT binding) reports healthy latency.
+     * - Short sleep (< WAKE_RESET_THRESHOLD_MS): force an immediate probe.
+     *   Catches a broken tunnel the moment the user looks at the phone,
+     *   instead of waiting up to CHECK_INTERVAL_MS for the next tick. Feeds
+     *   the same failure counter as the main loop, so a failure flips the
+     *   loop into RETRY_INTERVAL_MS cadence.
      *
-     * Fix: after a long enough sleep, do a full VPN restart — same path as
-     * onConnectivityLost / network change. Tears down QUIC, rebinds sockets.
+     * - Long sleep (>= WAKE_RESET_THRESHOLD_MS): full VPN restart, skipping
+     *   the probe entirely. After ~minute of silence the Hysteria2 QUIC
+     *   session has outlived its NAT binding on the path, and apps' TCP
+     *   connections have all died. A probe would wrongly report healthy
+     *   (its own stream re-opens the binding) while real traffic fails —
+     *   only a full stop→start rebinds sockets and tears down stale QUIC.
      */
     fun onWakeFromSleep(scope: CoroutineScope) {
-        // Skip if we haven't established a baseline yet — engine may still be
-        // starting; a restart on incomplete state is wasteful.
         if (lastSelectorSelected == null) return
 
         val off = lastScreenOffAt
         val sleepMs = if (off > 0L) System.currentTimeMillis() - off else 0L
-        if (sleepMs < WAKE_RESET_THRESHOLD_MS) {
-            AppLog.i(TAG, "Screen on — sleep ${sleepMs}ms < ${WAKE_RESET_THRESHOLD_MS}ms threshold, skipping")
-            return
-        }
 
         networkCheckJob?.cancel()
         networkCheckJob = scope.launch(Dispatchers.IO) {
-            AppLog.i(TAG, "Screen on after ${sleepMs}ms sleep — restarting VPN")
-            tunnelFailures = 0
-            runCatching { onConnectivityLost() }
-                .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
+            if (sleepMs >= WAKE_RESET_THRESHOLD_MS) {
+                AppLog.i(TAG, "Screen on after ${sleepMs}ms — restarting VPN to drop stale QUIC/TCP")
+                tunnelFailures = 0
+                runCatching { onConnectivityLost() }
+                    .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
+                return@launch
+            }
+            AppLog.i(TAG, "Screen on after ${sleepMs}ms — forcing health check")
+            handleProbeResult(probe())
+            // Wake the main loop so the next tick lands at the adaptive
+            // interval (5s if this probe failed, 30s otherwise), not at
+            // whatever the previous schedule had queued.
+            wakeSignal?.complete(Unit)
         }
     }
 
@@ -206,7 +249,14 @@ class VpnHealthCheck(
 
     private data class ProbeResult(
         val libboxAlive: Boolean,
-        val outboundHealthy: Boolean
+        val outboundHealthy: Boolean,
+        /**
+         * True when the probe failed because the unix socket file itself
+         * does not exist. That's an unambiguous sign the CommandServer
+         * goroutine is dead — no point retrying, trigger a full restart
+         * immediately.
+         */
+        val socketMissing: Boolean = false
     )
 
     /**
@@ -217,6 +267,7 @@ class VpnHealthCheck(
     private fun probe(): ProbeResult {
         var client: CommandClient? = null
         val handler = GroupAwareHandler()
+        var socketMissing = false
         val libboxAlive = try {
             val options = CommandClientOptions().apply {
                 // Subscribe to Group pushes — without this, writeGroups is never
@@ -230,13 +281,23 @@ class VpnHealthCheck(
             Thread.sleep(GROUP_STATE_WAIT_MS)
             true
         } catch (e: Exception) {
-            AppLog.w(TAG, "Ping failed: ${e.message}")
+            val msg = e.message ?: ""
+            // gRPC reports `connect: no such file or directory` when the unix
+            // socket file is gone — CommandServer goroutine is dead and a
+            // reload won't bring it back. Only a full VPN restart recreates
+            // the listener, so fail fast instead of waiting MAX_FAILURES.
+            socketMissing = msg.contains("no such file or directory")
+            AppLog.w(TAG, "Ping failed: $msg")
             false
         } finally {
             try { client?.disconnect() } catch (_: Exception) {}
         }
 
-        if (!libboxAlive) return ProbeResult(libboxAlive = false, outboundHealthy = false)
+        if (!libboxAlive) return ProbeResult(
+            libboxAlive = false,
+            outboundHealthy = false,
+            socketMissing = socketMissing
+        )
 
         val selected = handler.selectorSelected
         if (selected != null) {

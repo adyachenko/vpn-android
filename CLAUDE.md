@@ -1,5 +1,28 @@
 # sing-box Config Manager — Android App
 
+## ⚠️ Обязательная литература перед правками
+
+**`wiki/vpn-health-check.md`** — архитектура и обоснование логики
+health-check'а (VpnHealthCheck, BoxService.onVpnUnhealthy,
+onWakeFromSleep, onNetworkChanged, параметры интервалов/порогов).
+
+Правила:
+
+- **Перед любыми правками** в `vpn/VpnHealthCheck.kt`,
+  `vpn/BoxService.kt` (пути start/stop/restart/reload, callback'и
+  onVpnUnhealthy/onConnectivityLost/onScreenOn/onNetworkChanged),
+  `vpn/VPNService.kt` (screen receiver, network monitor) — **сначала
+  прочитать** `wiki/vpn-health-check.md` целиком. Там есть §12 чеклист
+  ревью; пройтись по нему перед коммитом.
+- **После** любой такой правки или после найденной в поле проблемы —
+  **обновить** `wiki/vpn-health-check.md`: добавить запись в §13
+  (история правок), при необходимости поправить §4 (параметры), §11
+  (ложные срабатывания), §12 (чеклист).
+- Все числа в `companion object VpnHealthCheck` и все ветки
+  `onWakeFromSleep` настроены методом проб и ошибок на реальных отказах
+  (Hysteria2 / Doze / смена сети). Любое изменение — регрессия пока не
+  доказано обратное.
+
 ## Обзор
 
 Android-приложение для управления sing-box VPN. Встраивает libbox напрямую (без SFA), управляет VPN через Android VpnService. Скачивает конфиг с сервера, позволяет настраивать домены и приложения, генерирует финальный JSON и запускает VPN.

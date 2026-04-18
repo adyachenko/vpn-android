@@ -399,17 +399,32 @@ object BoxService : CommandServerHandler {
         }
     }
 
+    /**
+     * Called when health check can't reach libbox's CommandServer
+     * (command.sock missing / ping timeouts). A reload via
+     * startOrReloadService() does NOT help here: that call only swaps config
+     * inside a live CommandServer, it does not recreate the unix-socket
+     * listener. The listener is created once in server.start() during
+     * onStartCommand(), so once the Go goroutine behind it dies, the only
+     * recovery is a full stop→start — the same path the user takes by
+     * toggling VPN off/on.
+     *
+     * Shares throttle with onConnectivityLost: both paths can fire on the
+     * same incident; we want at most one restart per MIN_RESTART_INTERVAL_MS.
+     */
     private fun onVpnUnhealthy() {
-        AppLog.e(TAG, "Health check reported VPN unhealthy — reloading sing-box engine")
+        val now = System.currentTimeMillis()
+        if (now - lastConnectivityRestart < MIN_RESTART_INTERVAL_MS) {
+            AppLog.w(TAG, "Skipping unhealthy restart — last restart was ${(now - lastConnectivityRestart) / 1000}s ago")
+            return
+        }
+        lastConnectivityRestart = now
+
+        val ctx = vpnService ?: return
         val config = configContent ?: return
-        GlobalScope.launch(Dispatchers.IO) {
-            try {
-                val overrideOptions = OverrideOptions()
-                commandServer?.startOrReloadService(config, overrideOptions)
-                AppLog.i(TAG, "VPN engine reloaded after health check failure")
-            } catch (e: Exception) {
-                AppLog.e(TAG, "Reload after health check failure failed", e)
-            }
+        AppLog.e(TAG, "Health check reported VPN unhealthy — full VPN restart")
+        GlobalScope.launch(Dispatchers.Main) {
+            restart(ctx, config)
         }
     }
 
