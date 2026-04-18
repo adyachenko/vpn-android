@@ -17,9 +17,11 @@ import io.nekohasekai.libbox.SystemProxyStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -52,6 +54,10 @@ object BoxService : CommandServerHandler {
     private var binder: ServiceBinder? = null
     private var healthCheck: VpnHealthCheck? = null
     private var healthScope: CoroutineScope? = null
+    // Job of the in-flight stop() coroutine. Cancelled by forceResetForRestart()
+    // so the post-closeService() teardown steps (close/notify/stopSelf/status)
+    // don't execute against a successor instance spawned by restart().
+    private var stopJob: Job? = null
 
     @Volatile
     private var lastConnectivityRestart: Long = 0
@@ -107,19 +113,30 @@ object BoxService : CommandServerHandler {
         status.postValue(Status.Stopping)
         AppLog.i(TAG, "Status set to Stopping")
         stopHealthCheck()
-        GlobalScope.launch(Dispatchers.IO) {
+        // Capture all mutable refs up-front. closeService() is a blocking Go call
+        // that can outlive RESTART_STOP_TIMEOUT_MS; by the time this coroutine
+        // resumes after it, restart() may already have spawned a successor
+        // (new CommandServer / VPNService / notification). Reading the globals
+        // at that point would apply close/stopSelf/status-update to the new
+        // instance and break it (the exact bug v1.2.13 hit in the field).
+        val localVpnService = vpnService
+        val localCommandServer = commandServer
+        val localNotification = notification
+        stopJob = GlobalScope.launch(Dispatchers.IO) {
             // 1. Close TUN fd
-            vpnService?.closeTun()
+            localVpnService?.closeTun()
             AppLog.i(TAG, "TUN closed")
 
             // 2. Stop sing-box engine (releases dup'd TUN fd).
             // closeService() is a blocking Go call that may hang on QUIC/Hysteria2
-            // outbound shutdown. We can't cancel it, but withTimeoutOrNull lets the
-            // Kotlin side move on — the goroutine will finish asynchronously.
+            // outbound shutdown. withTimeoutOrNull can't actually cancel the Go
+            // call — the Kotlin coroutine stays blocked until Go returns — but
+            // forceResetForRestart() will cancel stopJob, and the isActive check
+            // below lets us bail out before touching the successor instance.
             try {
                 val t0 = System.currentTimeMillis()
                 val completed = withTimeoutOrNull(CLOSE_SERVICE_TIMEOUT_MS) {
-                    commandServer?.closeService()
+                    localCommandServer?.closeService()
                     true
                 }
                 val dt = System.currentTimeMillis() - t0
@@ -132,9 +149,18 @@ object BoxService : CommandServerHandler {
                 AppLog.e(TAG, "closeService() error", e)
             }
 
+            // If restart() fired forceResetForRestart() while we were blocked in
+            // closeService(), a successor VPN instance is now live. Skip the rest
+            // of teardown — running close/stopSelf/status against the successor
+            // would tear it down.
+            if (!isActive) {
+                AppLog.i(TAG, "stop() cancelled during closeService — skipping post-close teardown")
+                return@launch
+            }
+
             // 3. Close command server
             try {
-                commandServer?.close()
+                localCommandServer?.close()
                 AppLog.i(TAG, "CommandServer closed")
             } catch (e: Exception) {
                 AppLog.e(TAG, "CommandServer close error", e)
@@ -146,7 +172,7 @@ object BoxService : CommandServerHandler {
             // stopping from the QS tile) the system may kill the process before the
             // engine releases its dup'd TUN fd — leaving the VPN icon stuck.
             withContext(Dispatchers.Main) {
-                notification?.close()
+                localNotification?.close()
             }
 
             // 5. Stop Android service
@@ -179,9 +205,19 @@ object BoxService : CommandServerHandler {
      */
     fun restart(context: Context, newConfig: String) {
         AppLog.i(TAG, "restart() requested, current status=${status.value}")
-        if (status.value != Status.Started) {
-            AppLog.i(TAG, "Not running — saving config only")
-            this.configContent = newConfig
+        this.configContent = newConfig
+        val currentStatus = status.value
+        if (currentStatus == Status.Stopped) {
+            // Desync recovery path: status is Stopped but a stale health check
+            // or a stranded Android VPNService may still be around. Just call
+            // start() — it will spin up a fresh CommandServer + VpnHealthCheck,
+            // superseding whatever orphan state exists.
+            AppLog.i(TAG, "Not running — starting fresh (recovery path)")
+            start(context, newConfig)
+            return
+        }
+        if (currentStatus != Status.Started) {
+            AppLog.w(TAG, "restart() while $currentStatus — skipping to avoid double-transition")
             return
         }
         GlobalScope.launch(Dispatchers.Main) {
@@ -213,6 +249,12 @@ object BoxService : CommandServerHandler {
      * CommandServer and the Android service lifecycle is reset via stopSelf().
      */
     private fun forceResetForRestart() {
+        // Cancel the in-flight stop() coroutine. It may still be blocked inside
+        // Go's closeService() — cancellation only takes effect once Go returns
+        // control — but the isActive check in stop() will then bail out before
+        // touching the successor instance.
+        stopJob?.cancel()
+        stopJob = null
         commandServer = null
         service = null
         vpnService = null
@@ -384,6 +426,14 @@ object BoxService : CommandServerHandler {
      * dead Hysteria2 UDP outbound is only recoverable by rebinding sockets.
      */
     private fun onConnectivityLost() {
+        if (status.value != Status.Started) {
+            // Orphan health check firing against a torn-down (or superseded)
+            // BoxService. Kill it and bail — any real recovery goes through
+            // a fresh start() which will spin up its own health check.
+            AppLog.w(TAG, "Skipping connectivity restart — status=${status.value}, stopping stale health check")
+            stopHealthCheck()
+            return
+        }
         val now = System.currentTimeMillis()
         if (now - lastConnectivityRestart < MIN_RESTART_INTERVAL_MS) {
             AppLog.w(TAG, "Skipping connectivity restart — last restart was ${(now - lastConnectivityRestart) / 1000}s ago")
@@ -413,6 +463,14 @@ object BoxService : CommandServerHandler {
      * same incident; we want at most one restart per MIN_RESTART_INTERVAL_MS.
      */
     private fun onVpnUnhealthy() {
+        if (status.value != Status.Started) {
+            // Orphan health check firing against a torn-down (or superseded)
+            // BoxService. Kill it and bail — if a real recovery is needed the
+            // next start() will spin up its own health check.
+            AppLog.w(TAG, "Skipping unhealthy restart — status=${status.value}, stopping stale health check")
+            stopHealthCheck()
+            return
+        }
         val now = System.currentTimeMillis()
         if (now - lastConnectivityRestart < MIN_RESTART_INTERVAL_MS) {
             AppLog.w(TAG, "Skipping unhealthy restart — last restart was ${(now - lastConnectivityRestart) / 1000}s ago")
