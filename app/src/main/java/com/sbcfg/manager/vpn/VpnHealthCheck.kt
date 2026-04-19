@@ -2,6 +2,7 @@ package com.sbcfg.manager.vpn
 
 import android.net.ConnectivityManager
 import com.sbcfg.manager.util.AppLog
+import com.sbcfg.manager.util.HealthMetrics
 import io.nekohasekai.libbox.CommandClient
 import io.nekohasekai.libbox.CommandClientHandler
 import io.nekohasekai.libbox.CommandClientOptions
@@ -11,9 +12,11 @@ import io.nekohasekai.libbox.LogIterator
 import io.nekohasekai.libbox.OutboundGroupIterator
 import io.nekohasekai.libbox.StatusMessage
 import io.nekohasekai.libbox.StringIterator
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -84,11 +87,48 @@ class VpnHealthCheck(
         // which rip TCP sockets well before the typical 30–60s UDP timeout.
         // Shorter risks unnecessary restarts on quick screen-peek patterns.
         private const val WAKE_RESET_THRESHOLD_MS = 15_000L
+
+        // --- TX/RX stall detector (active between probes) ---
+        // How often libbox pushes StatusMessage to our persistent Status
+        // subscriber. 1s matches sfa's dashboard and gives us sub-second
+        // granularity for pattern detection without hammering the server.
+        private const val STATUS_PUSH_INTERVAL_MS = 1_000L
+        // Rolling window (in StatusMessage ticks ≈ seconds) for the stall
+        // pattern. 3 ticks ≈ 3s — enough to see sustained retries from real
+        // apps (Chrome, Telegram) against a black-holed tunnel without
+        // triggering on a one-off spike.
+        private const val RX_WATCHER_WINDOW = 3
+        // Uplink threshold (bytes) over the window that signals "apps are
+        // actively trying to push data". Below this we assume idle and skip
+        // the detector — RX=0 on idle is expected, not a stall.
+        private const val RX_WATCHER_TX_THRESHOLD = 10_240L
+        // Downlink ceiling (bytes) over the window. QUIC keepalives/ACKs to
+        // Hysteria2 are tens of bytes; 512B keeps the floor above that but
+        // well below any real HTTP response payload.
+        private const val RX_WATCHER_RX_THRESHOLD = 512L
+        // Consecutive suspicious windows before we declare DEAD. Three
+        // windows = ~9s of continuous "tx without rx" — matches the typical
+        // TCP retransmit cadence, and catches the Chrome ERR_CONNECTION_*
+        // wave before the user's retry limit.
+        private const val RX_WATCHER_CONFIRM_TICKS = 3
+        // Throttle: minimum gap between stall-triggered restarts. Same value
+        // as BoxService.MIN_RESTART_INTERVAL_MS — one dead-tunnel restart
+        // per minute is plenty; more than that means something else is wrong
+        // and hammering restarts only makes it worse.
+        private const val MIN_STALL_RESTART_INTERVAL_MS = 60_000L
+        // Status subscription retry delay after a failure (e.g. engine not
+        // ready, socket closed). Matches RETRY_INTERVAL_MS for symmetry.
+        private const val STATUS_RETRY_DELAY_MS = 5_000L
     }
 
     private var job: Job? = null
     private var networkCheckJob: Job? = null
+    private var statusJob: Job? = null
+    private var statusClient: CommandClient? = null
     private var tunnelFailures = 0
+
+    @Volatile
+    private var lastStallRestartAt: Long = 0L
 
     @Volatile
     private var lastSelectorSelected: String? = null
@@ -122,6 +162,40 @@ class VpnHealthCheck(
                     kotlinx.coroutines.withTimeoutOrNull(nextDelay) { signal.await() }
                 } finally {
                     wakeSignal = null
+                }
+            }
+        }
+        // Persistent Status subscriber: independent channel that feeds the
+        // TX/RX stall detector between probe() ticks. Not part of probe()
+        // because probes are short-lived (600ms) and we need continuous
+        // traffic-counter deltas to catch a black-holed tunnel while apps
+        // are actively retrying — the scenario probe() itself cannot see.
+        statusJob = scope.launch(Dispatchers.IO) {
+            // Give libbox the same warm-up window as the main loop so we
+            // don't hammer an engine that's still binding its sockets.
+            delay(INITIAL_DELAY_MS)
+            while (isActive) {
+                val detector = TunnelStallDetector()
+                val options = CommandClientOptions().apply {
+                    addCommand(Libbox.CommandStatus)
+                    statusInterval = STATUS_PUSH_INTERVAL_MS
+                }
+                val client = CommandClient(detector, options)
+                try {
+                    client.connect()
+                    statusClient = client
+                    AppLog.i(TAG, "Status subscription connected (interval=${STATUS_PUSH_INTERVAL_MS}ms)")
+                    // Block until this scope is cancelled — the handler
+                    // pushes updates on the libbox push thread.
+                    awaitCancellation()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    AppLog.w(TAG, "Status subscription failed: ${e.message}")
+                    delay(STATUS_RETRY_DELAY_MS)
+                } finally {
+                    statusClient = null
+                    runCatching { client.disconnect() }
                 }
             }
         }
@@ -243,8 +317,14 @@ class VpnHealthCheck(
         job = null
         networkCheckJob?.cancel()
         networkCheckJob = null
+        statusJob?.cancel()
+        statusJob = null
+        runCatching { statusClient?.disconnect() }
+        statusClient = null
         tunnelFailures = 0
         lastScreenOffAt = 0L
+        lastStallRestartAt = 0L
+        HealthMetrics.clear()
     }
 
     private data class ProbeResult(
@@ -268,6 +348,15 @@ class VpnHealthCheck(
         var client: CommandClient? = null
         val handler = GroupAwareHandler()
         var socketMissing = false
+        // Force a fresh URL-test in the background before we read delays.
+        // Without this, the group values we read below are whatever the
+        // internal urltest interval last measured — potentially 60s stale
+        // and wrong if the network path changed during that minute.
+        // urlTest() is asynchronous: it kicks off the HTTP probe through
+        // each outbound and the updated delays land in writeGroups shortly
+        // after (covered by GROUP_STATE_WAIT_MS below).
+        runCatching { Libbox.newStandaloneCommandClient().urlTest(PROXY_AUTO_TAG) }
+            .onFailure { AppLog.w(TAG, "urlTest($PROXY_AUTO_TAG) failed: ${it.message}") }
         val libboxAlive = try {
             val options = CommandClientOptions().apply {
                 // Subscribe to Group pushes — without this, writeGroups is never
@@ -316,6 +405,15 @@ class VpnHealthCheck(
         }
 
         AppLog.i(TAG, "Proxy outbounds: ${auto.description} (selector=$selected)")
+
+        HealthMetrics.updateProbe(
+            HealthMetrics.ProbeSummary(
+                selectorSelected = selected,
+                hysteriaDelayMs = auto.hysteriaDelay,
+                naiveDelayMs = auto.naiveDelay,
+                timestampMs = System.currentTimeMillis(),
+            )
+        )
 
         applyPreferencePolicy(selected, auto)
 
@@ -406,5 +504,132 @@ class VpnHealthCheck(
         override fun writeConnectionEvents(events: ConnectionEvents?) {}
         override fun writeLogs(logs: LogIterator?) {}
         override fun writeStatus(status: StatusMessage?) {}
+    }
+
+    /**
+     * Passive end-to-end tunnel health detector. Runs as a long-lived
+     * CommandStatus subscriber (not part of probe()) so we see traffic
+     * counters every STATUS_PUSH_INTERVAL_MS regardless of the main probe
+     * cadence.
+     *
+     * Detects the "apps retrying into a black-holed tunnel" pattern:
+     * uplink is climbing (TCP retransmits from browsers / push clients),
+     * but downlink stays flat (no answers from the server). This is the
+     * exact symptom of the short-sleep QUIC-NAT-lie that probe() cannot
+     * catch — probe()'s own stream re-opens the NAT binding and reports
+     * "healthy" while real application sockets are dead.
+     *
+     * Trigger conditions (RX_WATCHER_CONFIRM_TICKS consecutive windows):
+     *   sum(dtx over window) > RX_WATCHER_TX_THRESHOLD  (10 KB)
+     *   sum(drx over window) < RX_WATCHER_RX_THRESHOLD  (512 B)
+     *
+     * Downlink threshold sits above QUIC keepalive/ACK noise but well
+     * below any real HTTP response, so idle periods (no tx either) don't
+     * false-positive.
+     */
+    private inner class TunnelStallDetector : CommandClientHandler {
+        private var prevUpTotal = -1L
+        private var prevDownTotal = -1L
+        private val window = ArrayDeque<Pair<Long, Long>>()
+        private var consecutiveSuspicious = 0
+
+        override fun writeStatus(status: StatusMessage?) {
+            if (status == null) return
+            val upTotal = status.uplinkTotal
+            val downTotal = status.downlinkTotal
+
+            // First tick — seed the baseline. No delta possible.
+            if (prevUpTotal < 0L) {
+                prevUpTotal = upTotal
+                prevDownTotal = downTotal
+                publish(status, HealthMetrics.StallState.HEALTHY, 0)
+                return
+            }
+
+            // coerceAtLeast(0) guards against libbox's counters resetting
+            // on an internal reload, which would otherwise produce a giant
+            // negative delta and break the window sums.
+            val dtx = (upTotal - prevUpTotal).coerceAtLeast(0L)
+            val drx = (downTotal - prevDownTotal).coerceAtLeast(0L)
+            prevUpTotal = upTotal
+            prevDownTotal = downTotal
+
+            window.addLast(dtx to drx)
+            while (window.size > RX_WATCHER_WINDOW) window.removeFirst()
+
+            val sumTx = window.sumOf { it.first }
+            val sumRx = window.sumOf { it.second }
+            val windowFull = window.size >= RX_WATCHER_WINDOW
+            val isSuspicious =
+                windowFull && sumTx > RX_WATCHER_TX_THRESHOLD && sumRx < RX_WATCHER_RX_THRESHOLD
+            consecutiveSuspicious = if (isSuspicious) consecutiveSuspicious + 1 else 0
+
+            val state = when {
+                consecutiveSuspicious >= RX_WATCHER_CONFIRM_TICKS -> HealthMetrics.StallState.DEAD
+                isSuspicious -> HealthMetrics.StallState.SUSPICIOUS
+                else -> HealthMetrics.StallState.HEALTHY
+            }
+
+            publish(status, state, consecutiveSuspicious)
+
+            // Log only when there's actual traffic — otherwise we flood
+            // the buffer with idle-device ticks.
+            if (dtx > 0 || drx > 0) {
+                AppLog.i(
+                    TAG,
+                    "rx-watcher: dtx=${dtx}B drx=${drx}B " +
+                            "sumTx=${sumTx}B sumRx=${sumRx}B " +
+                            "up=${status.uplink}Bps down=${status.downlink}Bps " +
+                            "state=$state susp=$consecutiveSuspicious",
+                )
+            }
+
+            if (state == HealthMetrics.StallState.DEAD) {
+                val now = System.currentTimeMillis()
+                if (now - lastStallRestartAt < MIN_STALL_RESTART_INTERVAL_MS) {
+                    return
+                }
+                lastStallRestartAt = now
+                AppLog.e(
+                    TAG,
+                    "rx-watcher DETECT: tunnel stalled " +
+                            "(tx=${sumTx}B, rx=${sumRx}B over ${window.size} ticks) — restarting",
+                )
+                // Reset the local window so we don't re-trigger until we've
+                // seen fresh data through the new tunnel.
+                window.clear()
+                consecutiveSuspicious = 0
+                runCatching { onConnectivityLost() }
+                    .onFailure { AppLog.e(TAG, "rx-watcher onConnectivityLost failed", it) }
+            }
+        }
+
+        private fun publish(
+            status: StatusMessage,
+            state: HealthMetrics.StallState,
+            susp: Int,
+        ) {
+            HealthMetrics.update(
+                HealthMetrics.RxSnapshot(
+                    uplinkBps = status.uplink,
+                    downlinkBps = status.downlink,
+                    uplinkTotal = status.uplinkTotal,
+                    downlinkTotal = status.downlinkTotal,
+                    stallState = state,
+                    suspiciousCount = susp,
+                    timestampMs = System.currentTimeMillis(),
+                )
+            )
+        }
+
+        override fun clearLogs() {}
+        override fun connected() {}
+        override fun disconnected(message: String?) {}
+        override fun initializeClashMode(modes: StringIterator?, current: String?) {}
+        override fun setDefaultLogLevel(level: Int) {}
+        override fun updateClashMode(mode: String?) {}
+        override fun writeConnectionEvents(events: ConnectionEvents?) {}
+        override fun writeLogs(logs: LogIterator?) {}
+        override fun writeGroups(groups: OutboundGroupIterator?) {}
     }
 }

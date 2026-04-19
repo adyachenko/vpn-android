@@ -51,6 +51,13 @@ object BoxService : CommandServerHandler {
     private var vpnService: VPNService? = null
     private var notification: ServiceNotification? = null
     private var configContent: String? = null
+
+    /**
+     * Read-only snapshot of the currently loaded sing-box config. Used by
+     * DiagnosticsExporter to include (credential-masked) routing state in
+     * exported logs. Null while VPN is stopped.
+     */
+    fun currentConfigSnapshot(): String? = configContent
     private var binder: ServiceBinder? = null
     private var healthCheck: VpnHealthCheck? = null
     private var healthScope: CoroutineScope? = null

@@ -53,4 +53,9 @@ object AppLog {
             _flow.value = emptyList()
         }
     }
+
+    /** Full buffer as plain text for diagnostics export. */
+    fun exportSnapshot(): String = synchronized(_entries) {
+        _entries.joinToString("\n") { it.toString() }
+    }
 }
