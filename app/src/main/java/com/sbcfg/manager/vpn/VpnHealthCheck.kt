@@ -119,6 +119,16 @@ class VpnHealthCheck(
         // Status subscription retry delay after a failure (e.g. engine not
         // ready, socket closed). Matches RETRY_INTERVAL_MS for symmetry.
         private const val STATUS_RETRY_DELAY_MS = 5_000L
+        // Drop StatusMessage pushes arriving faster than this. Libbox
+        // drains its buffered Status events all at once on closeService()
+        // (observed 17 pushes in 1ms during a stop), which would otherwise
+        // stack into a fake DEAD detect. Half the push interval leaves
+        // plenty of room for real jitter while cutting the burst to 1 tick.
+        private const val STATUS_MIN_GAP_MS = STATUS_PUSH_INTERVAL_MS / 2
+        // Log one rx-watcher line every N non-idle ticks (or immediately on
+        // state change). Without this, 500-entry AppLog buffer holds ~30s
+        // of history — not enough to calibrate or diagnose after the fact.
+        private const val RX_WATCHER_LOG_EVERY = 5
     }
 
     private var job: Job? = null
@@ -532,9 +542,20 @@ class VpnHealthCheck(
         private var prevDownTotal = -1L
         private val window = ArrayDeque<Pair<Long, Long>>()
         private var consecutiveSuspicious = 0
+        private var lastTickAtMs = 0L
+        private var lastLoggedState: HealthMetrics.StallState? = null
+        private var logCounter = 0
 
         override fun writeStatus(status: StatusMessage?) {
             if (status == null) return
+            val now = System.currentTimeMillis()
+            // Drop burst pushes (engine shutdown drain, etc.). Real pushes
+            // come at STATUS_PUSH_INTERVAL_MS; anything closer is libbox
+            // flushing its buffer and would stack our window into a fake
+            // DEAD within milliseconds.
+            if (lastTickAtMs > 0L && now - lastTickAtMs < STATUS_MIN_GAP_MS) return
+            lastTickAtMs = now
+
             val upTotal = status.uplinkTotal
             val downTotal = status.downlinkTotal
 
@@ -572,9 +593,14 @@ class VpnHealthCheck(
 
             publish(status, state, consecutiveSuspicious)
 
-            // Log only when there's actual traffic — otherwise we flood
-            // the buffer with idle-device ticks.
-            if (dtx > 0 || drx > 0) {
+            // Log sparingly: always on state change (that's the signal
+            // we care about), otherwise one line per RX_WATCHER_LOG_EVERY
+            // non-idle ticks. Full per-second deltas still live in the
+            // HealthMetrics history ring and show up in the export.
+            val stateChanged = state != lastLoggedState
+            val hasTraffic = dtx > 0 || drx > 0
+            if (hasTraffic) logCounter++
+            if (stateChanged || (hasTraffic && logCounter % RX_WATCHER_LOG_EVERY == 0)) {
                 AppLog.i(
                     TAG,
                     "rx-watcher: dtx=${dtx}B drx=${drx}B " +
@@ -582,6 +608,7 @@ class VpnHealthCheck(
                             "up=${status.uplink}Bps down=${status.downlink}Bps " +
                             "state=$state susp=$consecutiveSuspicious",
                 )
+                lastLoggedState = state
             }
 
             if (state == HealthMetrics.StallState.DEAD) {
