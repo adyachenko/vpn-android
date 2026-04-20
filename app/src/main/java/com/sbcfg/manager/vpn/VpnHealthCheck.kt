@@ -43,16 +43,17 @@ import kotlinx.coroutines.launch
  *                      → revert selector to proxy-auto (urltest picks naive)
  *   both timing out    → existing onConnectivityLost → full restart
  *
- * End-to-end DNS probe (since v1.2.17):
- * urltest alone misses a class of failure where sing-box's internal DNS
- * server on 172.19.0.2:53 silently stops answering queries while the
- * outbound itself is still healthy — apps then get UnknownHostException on
- * every request. We send a real DNS query through tun to the in-tunnel DNS
- * address and treat two consecutive no-replies as onConnectivityLost.
- * This became possible after we stopped calling
- * addDisallowedApplication(packageName); app HTTP clients now bypass the
- * tunnel per-socket via ProtectedSocketFactory, leaving probe sockets free
- * to actually go through tun.
+ * Why not a direct socket probe?
+ * The VPN-owning app is excluded from its own tunnel via
+ * addDisallowedApplication(packageName) — that prevents config-fetch loops
+ * and keeps startup traffic (WorkManager, Hilt, DNS lookups) off the tunnel.
+ * That exclusion also makes Network.bindSocket() to the VPN network fail
+ * with EPERM, so we can't send a test packet through tun from this process.
+ * urltest delays measured by sing-box itself are the source of truth.
+ *
+ * DNS-handler silent failure (issue #001) is NOT caught by the current
+ * signals. See probeDns() — kept as a stub for a future detector that will
+ * likely bind via ConnectivityManager.getNetworkForType(TYPE_VPN).
  */
 class VpnHealthCheck(
     @Suppress("unused") private val connectivityManager: ConnectivityManager,
@@ -499,72 +500,29 @@ class VpnHealthCheck(
     }
 
     /**
-     * Sends a real UDP DNS query to sing-box's in-tunnel DNS address and
-     * returns whether it got any reply within [DNS_PROBE_TIMEOUT_MS].
+     * DNS-handler health probe. DISABLED for now (always returns true).
      *
-     * We don't parse the response — we only care whether the handler is
-     * alive enough to emit bytes back. A correct reply has the same query
-     * id in the first 2 bytes, which is our only validation.
+     * The intent was to send a real UDP DNS query to 172.19.0.2:53 and catch
+     * the case where sing-box's DNS handler silently stops answering while
+     * outbound urltest still reports healthy (see wiki §1.3a, issue #001).
      *
-     * The socket is **not** protected, so Android's per-UID routing sends
-     * it via tun (our own package is in the allow-list now, see openTun()).
-     * That's exactly what we want: this call exercises the same path an
-     * app's DNS query takes.
+     * Problem: our process is excluded from the tunnel via
+     * addDisallowedApplication(packageName) — that means a DatagramSocket()
+     * created here routes via wlan0, NOT tun, and would either EPERM on
+     * bind to 172.19.0.1 or silently go to an address that doesn't answer.
+     *
+     * Attempting to flip the exclusion (v1.2.17 first pass) broke things
+     * differently — WorkManager/Hilt/etc traffic poured into the tunnel on
+     * startup and triggered the rx-watcher DEAD path within 3 seconds.
+     *
+     * Leaving the code structure in place (ProbeResult.dnsAlive, handleProbeResult
+     * branch, counters) so wiring is done when we find a real solution —
+     * likely a libbox command-channel DNS health endpoint, or binding this
+     * probe to the VPN Network via ConnectivityManager.getActiveNetwork().
+     * Until then, returning true means the DNS branch is never taken.
      */
-    private fun probeDns(): Boolean {
-        // If VPN isn't actually running from our perspective, skip — the
-        // probe socket would either fail to route or leak onto wlan0.
-        if (VpnServiceHolder.get() == null) return true
-
-        val socket = try {
-            java.net.DatagramSocket()
-        } catch (e: Exception) {
-            AppLog.w(TAG, "DNS probe: socket() failed: ${e.message}")
-            return false
-        }
-        return try {
-            socket.soTimeout = DNS_PROBE_TIMEOUT_MS
-            val query = buildDnsQuery(DNS_PROBE_HOST)
-            val addr = java.net.InetAddress.getByName(DNS_PROBE_ADDR)
-            socket.send(java.net.DatagramPacket(query, query.size, addr, DNS_PROBE_PORT))
-            val buf = ByteArray(512)
-            val packet = java.net.DatagramPacket(buf, buf.size)
-            socket.receive(packet)
-            // First 2 bytes are the transaction id we set. Match ensures we
-            // didn't pick up some unrelated datagram that happened to land
-            // on the same port.
-            val ok = packet.length >= 2 &&
-                packet.data[0] == query[0] &&
-                packet.data[1] == query[1]
-            if (!ok) AppLog.w(TAG, "DNS probe: reply id mismatch (len=${packet.length})")
-            ok
-        } catch (e: Exception) {
-            AppLog.w(TAG, "DNS probe to $DNS_PROBE_ADDR:$DNS_PROBE_PORT failed: ${e.message}")
-            false
-        } finally {
-            runCatching { socket.close() }
-        }
-    }
-
-    private fun buildDnsQuery(host: String): ByteArray {
-        val out = java.io.ByteArrayOutputStream()
-        val dos = java.io.DataOutputStream(out)
-        val id = (System.nanoTime() and 0xFFFF).toInt()
-        dos.writeShort(id)
-        dos.writeShort(0x0100) // standard query, recursion desired
-        dos.writeShort(1)      // qdcount
-        dos.writeShort(0)      // ancount
-        dos.writeShort(0)      // nscount
-        dos.writeShort(0)      // arcount
-        for (label in host.split('.')) {
-            dos.writeByte(label.length)
-            dos.write(label.toByteArray(Charsets.US_ASCII))
-        }
-        dos.writeByte(0)       // root
-        dos.writeShort(1)      // QTYPE = A
-        dos.writeShort(1)      // QCLASS = IN
-        return out.toByteArray()
-    }
+    @Suppress("FunctionOnlyReturningConstant")
+    private fun probeDns(): Boolean = true
 
     /**
      * Enforces "Hysteria2 first" at the selector level, bypassing urltest's

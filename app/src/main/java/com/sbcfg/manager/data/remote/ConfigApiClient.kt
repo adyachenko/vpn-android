@@ -11,6 +11,7 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 import java.io.IOException
 import java.net.URL
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -23,24 +24,22 @@ interface ConfigApiService {
 }
 
 @Singleton
-class ConfigApiClient @Inject constructor(
-    baseClient: OkHttpClient,
-) {
+class ConfigApiClient @Inject constructor() {
 
-    // Reuse the DI-provided client (which already installs ProtectedSocketFactory
-    // so config fetches bypass the tunnel — critical to avoid a deadlock when
-    // the config server and VPN server are on the same host). Layer the debug
-    // body logger on top without touching the socket factory.
-    private val okHttpClient: OkHttpClient = if (BuildConfig.DEBUG) {
-        baseClient.newBuilder()
-            .addInterceptor(
-                HttpLoggingInterceptor().apply {
-                    level = HttpLoggingInterceptor.Level.BODY
+    private val okHttpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .apply {
+                if (BuildConfig.DEBUG) {
+                    addInterceptor(
+                        HttpLoggingInterceptor().apply {
+                            level = HttpLoggingInterceptor.Level.BODY
+                        }
+                    )
                 }
-            )
+            }
             .build()
-    } else {
-        baseClient
     }
 
     fun createServiceForUrl(baseUrl: String): ConfigApiService {

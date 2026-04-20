@@ -1,19 +1,23 @@
 ---
 date: 2026-04-20
-status: closed
+status: open
 ---
 
 # Встроенный DNS-сервер libbox (172.19.0.2:53) тихо умирает, health-check не ловит
 
-**Закрыто в v1.2.17.** Детектор реализован: `VpnHealthCheck.probeDns()` шлёт
-UDP DNS-запрос к `172.19.0.2:53` через tun каждый тик основного цикла (после
-удаления `addDisallowedApplication(packageName)` стало возможно — см. ниже
-вариант «A расширенный»). Две подряд молчащих пробы → `onConnectivityLost()`.
+**v1.2.17 пробовал — откатили в v1.2.18.** Первый заход на решение убирал
+`addDisallowedApplication(packageName)` чтобы probe-сокет шёл через tun.
+На проде это вызвало traffic-storm: наш собственный процесс (WorkManager,
+Hilt, DNS-lookups) начинал лить ~4MB/s в тоннель сразу после старта, пока
+outbound ещё не готов, → rx-watcher зажигал DEAD на 3-м тике и отправлял в
+бесконечный restart-loop. Подтверждено в логах `dtx=3855296B drx=0B state=DEAD`
+после `TUN established`. В v1.2.18 `addDisallowedApplication(packageName)`
+возвращён, `probeDns()` заглушен (возвращает true всегда), ветка
+`handleProbeResult.!dnsAlive` и счётчик `dnsFailures` остаются в коде как
+каркас для будущего настоящего детектора.
 
-Unblocking-change: app-уровень HTTP теперь обходит тоннель per-socket через
-`ProtectedSocketFactory` (см. `di/AppModule.kt`), а собственный UID
-добавляется в allow-list в include-mode VPN (см. `VPNService.openTun`),
-чтобы probe-сокет реально шёл через tun.
+`ProtectedSocketFactory` оставлен как no-op safety-net (процесс excluded →
+protect() избыточен, но и не вредит).
 
 ## Проблема
 
@@ -63,35 +67,37 @@ Health-check должен детектить этот сбой и автомат
 
 ## Предлагаемый подход к детектору
 
-**Периодическая DNS-проба к `172.19.0.2:53` через CommandClient не подходит**
-(она ходит мимо tun-engine). Нужен прямой тест DNS через tun:
+**Вариант A (отложен, v1.2.17 попытка откачена):** открыть DatagramSocket
+из собственного процесса и отправить DNS-запрос в tun. Для этого процесс
+должен быть внутри тоннеля, т.е. убрать `addDisallowedApplication(packageName)`
+→ на проде это вызвало traffic-storm (~4MB/s в пустой tunnel от наших
+же WorkManager/Hilt/etc), rx-watcher ложно триггерил DEAD. Возможный
+фикс — убрать WorkManager вообще / отложить periodic jobs до момента
+когда tunnel установлен, и дать rx-watcher startup grace-period, но
+это большой комплексный рефактор; решение не оправдано только ради DNS-
+пробы.
 
-**Вариант A (предпочтительный):** kotlinx `DatagramSocket` → bind к
-`172.19.0.1` → send валидный DNS-запрос (A record для короткого домена,
-например `_health.local`) на `172.19.0.2:53` → `withTimeout(2s)` на
-`receive()`. Каденс: раз в N тиков основного цикла (не каждые 30с — это
-грузит libbox DNS лишним). N=3 (≈90с). Два подряд fail'а = restart.
+**Вариант B (наиболее перспективный):** bind probe-сокета к VPN Network
+через `ConnectivityManager.getNetworkForType(TYPE_VPN)` →
+`Network.bindSocket(socket)`. Android разрешает это даже для процесса,
+исключённого через addDisallowedApplication, если сокет явно bind'ится к
+VPN network. Нужно проверить поведение на Android 14+ (NetworkCapabilities
+API mогло измениться).
 
-**Проблема:** наш собственный процесс ходит мимо VPN через
-`addDisallowedApplication(packageName)` (см. wiki §3 «Почему НЕ делаем
-настоящий TCP-коннект»). Bind к 172.19.0.1 из нашего процесса даст
-EPERM — Android запрещает писать в VPN-интерфейс процессу, который
-сам исключён из VPN.
+**Вариант C:** расширить libbox (sing-box Go binding) собственной
+DNS-health-командой. Sing-box DNS имеет internal resolve API; достаточно
+exposнуть `Resolve("google.com") -> bool` через CommandClient. Требует
+пересборки `libbox.aar` из исходников. Меньше Android-специфичной магии,
+но больше Go-работы.
 
-**Вариант B:** вызывать `Libbox.newStandaloneCommandClient()` с новой
-командой DNS-test, если такая есть в libbox API (нужно проверить). Либо
-расширить handler — интересует есть ли в `CommandClient` что-то типа
-`queryDns()`.
+**Вариант D (кросс-сверка счётчиков):** тун-интерфейс имеет `RX/TX bytes`
+в `/proc/net/dev`. libbox StatusMessage имеет `uplinkTotal/downlinkTotal`.
+Если за окно tun1.TX растёт, а libbox.uplinkTotal не растёт — engine не
+обрабатывает пакеты. Но DNS-only failure этим не покрывается (libbox
+видит пакеты, передает outbound, считает в uplink, а DNS-handler при
+этом может быть мёртв).
 
-**Вариант C (кросс-сверка счётчиков):** тун-интерфейс имеет свои
-`RX/TX bytes` в `/proc/net/dev`. libbox StatusMessage имеет
-`uplinkTotal/downlinkTotal`. Если за окно tun1.TX растёт, а
-libbox.uplinkTotal не растёт — engine не обрабатывает пакеты. Но
-это не покрывает DNS-only failure (libbox видит пакеты, но DNS-handler
-их теряет, остальной трафик мог бы работать).
-
-Начать с инвестигации варианта B (расширение libbox API) — как минимум
-проверить, есть ли в Go-коде sing-box DNS health endpoint.
+Рекомендованный порядок инвестигации: B → C → D. A закрыт.
 
 ## Связано с
 

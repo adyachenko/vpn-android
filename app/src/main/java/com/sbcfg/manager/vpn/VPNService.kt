@@ -35,10 +35,6 @@ class VPNService : VpnService(), PlatformInterface {
 
     override fun onCreate() {
         super.onCreate()
-        // Register ourselves so ProtectedSocketFactory can bypass the tunnel
-        // for app-level HTTP clients. Must happen before any socket is created
-        // (OkHttp is lazy, but workers may kick in immediately after startup).
-        VpnServiceHolder.set(this)
         // Hysteria2 UDP dies after Doze strands the NAT binding (typically
         // ~60s of radio silence). No network-change callback fires on unlock
         // if wifi stayed the same, so we piggyback on ACTION_SCREEN_ON to
@@ -103,7 +99,6 @@ class VPNService : VpnService(), PlatformInterface {
         screenReceiver = null
         closeTun()
         BoxService.onServiceDestroy()
-        VpnServiceHolder.clear(this)
         super.onDestroy()
     }
 
@@ -173,36 +168,42 @@ class VPNService : VpnService(), PlatformInterface {
             }
         } catch (_: Exception) {}
 
-        // Include packages (per-app VPN). In include-mode, only UIDs explicitly
-        // added to the allow-list get routed through tun — every other UID
-        // (including ours) goes straight to wlan0. We need to add our own
-        // package here so VpnHealthCheck probe sockets actually reach
-        // 172.19.0.2 via tun instead of being dropped on wlan0.
+        // Include packages (per-app VPN). Skip our own package if the config
+        // happens to list it — we never want our background traffic
+        // (WorkManager, Hilt, DNS lookups for OkHttp) routed through tun, it
+        // causes startup traffic storms against a not-yet-ready tunnel (see
+        // v1.2.17 rollback in history).
         var inIncludeMode = false
         try {
             val iterator = options.includePackage
             while (iterator.hasNext()) {
                 inIncludeMode = true
+                val pkg = iterator.next()
+                if (pkg == packageName) {
+                    AppLog.i(TAG, "Skipping own package from allow-list: $pkg")
+                    continue
+                }
                 try {
-                    builder.addAllowedApplication(iterator.next())
+                    builder.addAllowedApplication(pkg)
                 } catch (_: Exception) {}
             }
         } catch (_: Exception) {}
-        if (inIncludeMode) {
-            try {
-                builder.addAllowedApplication(packageName)
-                AppLog.i(TAG, "Added own package to allow-list (for health probes): $packageName")
-            } catch (_: Exception) {}
-        }
 
-        // NOTE: we intentionally do NOT call addDisallowedApplication(packageName)
-        // here. Excluding the whole process prevents VpnHealthCheck from opening
-        // real probe sockets through tun (EPERM on bindSocket). Instead, app-level
-        // HTTP clients bypass the tunnel per-socket via ProtectedSocketFactory
-        // (see AppModule.provideOkHttpClient). Health-probe sockets (DNS to
-        // 172.19.0.2:53, HTTP to an in-tunnel health host) now route through tun
-        // as intended. If you add a new network client, reuse the DI OkHttpClient
-        // or it WILL route through the VPN.
+        // In exclude-mode (no includePackage entries), add our own package to
+        // the disallow-list so we bypass the tunnel. In include-mode Android
+        // rejects mixing allow+disallow, but that's fine: skipping our
+        // package above already keeps us out of the allow-list, so the UID
+        // isn't routed through tun anyway.
+        if (!inIncludeMode) {
+            try {
+                builder.addDisallowedApplication(packageName)
+                AppLog.i(TAG, "Excluded own package (exclude-mode): $packageName")
+            } catch (e: Exception) {
+                AppLog.w(TAG, "addDisallowedApplication($packageName) failed: ${e.message}")
+            }
+        } else {
+            AppLog.i(TAG, "include-mode active — own package bypasses VPN by virtue of not being in allow-list")
+        }
 
         val pfd = builder.establish()
         if (pfd == null) {
