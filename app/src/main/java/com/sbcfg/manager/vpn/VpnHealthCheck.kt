@@ -43,12 +43,16 @@ import kotlinx.coroutines.launch
  *                      → revert selector to proxy-auto (urltest picks naive)
  *   both timing out    → existing onConnectivityLost → full restart
  *
- * Why not a direct socket probe?
- * The VPN-owning app is excluded from its own tunnel (addDisallowedApplication
- * prevents routing loops when the app fetches config / reports to Sentry).
- * That exclusion also makes Network.bindSocket() to the VPN network fail with
- * EPERM — so we cannot send a test packet through the tunnel from this
- * process. We read the urltest delays that sing-box itself measured instead.
+ * End-to-end DNS probe (since v1.2.17):
+ * urltest alone misses a class of failure where sing-box's internal DNS
+ * server on 172.19.0.2:53 silently stops answering queries while the
+ * outbound itself is still healthy — apps then get UnknownHostException on
+ * every request. We send a real DNS query through tun to the in-tunnel DNS
+ * address and treat two consecutive no-replies as onConnectivityLost.
+ * This became possible after we stopped calling
+ * addDisallowedApplication(packageName); app HTTP clients now bypass the
+ * tunnel per-socket via ProtectedSocketFactory, leaving probe sockets free
+ * to actually go through tun.
  */
 class VpnHealthCheck(
     @Suppress("unused") private val connectivityManager: ConnectivityManager,
@@ -129,6 +133,29 @@ class VpnHealthCheck(
         // state change). Without this, 500-entry AppLog buffer holds ~30s
         // of history — not enough to calibrate or diagnose after the fact.
         private const val RX_WATCHER_LOG_EVERY = 5
+
+        // --- DNS probe (since v1.2.17) ---
+        // In-tunnel DNS server address assigned by sing-box to the tun peer.
+        // Must match the `address` range the engine publishes (172.19.0.0/30;
+        // .1 is the device side, .2 is the sing-box DNS endpoint). Changing
+        // the subnet in server config requires updating this constant.
+        private const val DNS_PROBE_ADDR = "172.19.0.2"
+        private const val DNS_PROBE_PORT = 53
+        // Domain we ask about. Any short valid label works — we don't parse
+        // the answer, we only care whether libbox replied at all. Using a
+        // host that's guaranteed to resolve (google.com) keeps the reply tiny
+        // and caches on the DNS side, avoiding outbound traffic for repeat
+        // probes.
+        private const val DNS_PROBE_HOST = "google.com"
+        // UDP recv timeout for a single probe. Local libbox DNS replies land
+        // in <50ms when healthy; 2s catches both socket-level stalls and
+        // cases where libbox is forwarding upstream and the path is slow.
+        private const val DNS_PROBE_TIMEOUT_MS = 2_000
+        // Consecutive DNS failures before declaring dead. Same cadence as
+        // tunnel-failure counter so the total-time-to-restart (~10s with
+        // RETRY_INTERVAL_MS) matches — no point making one signal slower
+        // than the others.
+        private const val MAX_DNS_FAILURES = 2
     }
 
     private var job: Job? = null
@@ -136,6 +163,7 @@ class VpnHealthCheck(
     private var statusJob: Job? = null
     private var statusClient: CommandClient? = null
     private var tunnelFailures = 0
+    private var dnsFailures = 0
 
     @Volatile
     private var lastStallRestartAt: Long = 0L
@@ -165,7 +193,7 @@ class VpnHealthCheck(
             delay(INITIAL_DELAY_MS)
             while (isActive) {
                 handleProbeResult(probe())
-                val nextDelay = if (failures > 0 || tunnelFailures > 0) RETRY_INTERVAL_MS else CHECK_INTERVAL_MS
+                val nextDelay = if (failures > 0 || tunnelFailures > 0 || dnsFailures > 0) RETRY_INTERVAL_MS else CHECK_INTERVAL_MS
                 val signal = kotlinx.coroutines.CompletableDeferred<Unit>()
                 wakeSignal = signal
                 try {
@@ -235,6 +263,7 @@ class VpnHealthCheck(
             }
             !result.outboundHealthy -> {
                 failures = 0
+                dnsFailures = 0
                 tunnelFailures++
                 AppLog.w(TAG, "All proxy outbounds timing out ($tunnelFailures/$MAX_TUNNEL_FAILURES)")
                 if (tunnelFailures >= MAX_TUNNEL_FAILURES) {
@@ -244,12 +273,32 @@ class VpnHealthCheck(
                         .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
                 }
             }
+            !result.dnsAlive -> {
+                // libbox ping passes, urltest passes, but the in-tunnel DNS
+                // handler silently stopped replying. Apps see
+                // UnknownHostException on every query. Only a full VPN
+                // restart is known to recover this — confirmed in prod on
+                // v1.2.16 (issue #001). Two consecutive silent DNS probes
+                // are enough: the handler either replies in <50ms or not
+                // at all, there's no transient middle ground.
+                failures = 0
+                tunnelFailures = 0
+                dnsFailures++
+                AppLog.w(TAG, "In-tunnel DNS silent ($dnsFailures/$MAX_DNS_FAILURES)")
+                if (dnsFailures >= MAX_DNS_FAILURES) {
+                    AppLog.e(TAG, "DNS handler dead — triggering VPN restart")
+                    dnsFailures = 0
+                    runCatching { onConnectivityLost() }
+                        .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
+                }
+            }
             else -> {
-                if (failures > 0 || tunnelFailures > 0) {
+                if (failures > 0 || tunnelFailures > 0 || dnsFailures > 0) {
                     AppLog.i(TAG, "Tunnel recovered")
                 }
                 failures = 0
                 tunnelFailures = 0
+                dnsFailures = 0
             }
         }
     }
@@ -332,6 +381,8 @@ class VpnHealthCheck(
         runCatching { statusClient?.disconnect() }
         statusClient = null
         tunnelFailures = 0
+        dnsFailures = 0
+        failures = 0
         lastScreenOffAt = 0L
         lastStallRestartAt = 0L
         HealthMetrics.clear()
@@ -346,7 +397,18 @@ class VpnHealthCheck(
          * goroutine is dead — no point retrying, trigger a full restart
          * immediately.
          */
-        val socketMissing: Boolean = false
+        val socketMissing: Boolean = false,
+        /**
+         * True when a real DNS query to the in-tunnel DNS address got a
+         * reply within timeout. False means sing-box's DNS handler stopped
+         * answering (known transient failure mode) — apps would be
+         * getting UnknownHostException even though libbox ping and outbound
+         * urltest both report healthy.
+         *
+         * Defaults to true so the early "libbox dead" / "no data yet" exit
+         * paths don't need to set it.
+         */
+        val dnsAlive: Boolean = true,
     )
 
     /**
@@ -427,7 +489,81 @@ class VpnHealthCheck(
 
         applyPreferencePolicy(selected, auto)
 
-        return ProbeResult(libboxAlive = true, outboundHealthy = auto.hasHealthy)
+        val dnsAlive = probeDns()
+
+        return ProbeResult(
+            libboxAlive = true,
+            outboundHealthy = auto.hasHealthy,
+            dnsAlive = dnsAlive,
+        )
+    }
+
+    /**
+     * Sends a real UDP DNS query to sing-box's in-tunnel DNS address and
+     * returns whether it got any reply within [DNS_PROBE_TIMEOUT_MS].
+     *
+     * We don't parse the response — we only care whether the handler is
+     * alive enough to emit bytes back. A correct reply has the same query
+     * id in the first 2 bytes, which is our only validation.
+     *
+     * The socket is **not** protected, so Android's per-UID routing sends
+     * it via tun (our own package is in the allow-list now, see openTun()).
+     * That's exactly what we want: this call exercises the same path an
+     * app's DNS query takes.
+     */
+    private fun probeDns(): Boolean {
+        // If VPN isn't actually running from our perspective, skip — the
+        // probe socket would either fail to route or leak onto wlan0.
+        if (VpnServiceHolder.get() == null) return true
+
+        val socket = try {
+            java.net.DatagramSocket()
+        } catch (e: Exception) {
+            AppLog.w(TAG, "DNS probe: socket() failed: ${e.message}")
+            return false
+        }
+        return try {
+            socket.soTimeout = DNS_PROBE_TIMEOUT_MS
+            val query = buildDnsQuery(DNS_PROBE_HOST)
+            val addr = java.net.InetAddress.getByName(DNS_PROBE_ADDR)
+            socket.send(java.net.DatagramPacket(query, query.size, addr, DNS_PROBE_PORT))
+            val buf = ByteArray(512)
+            val packet = java.net.DatagramPacket(buf, buf.size)
+            socket.receive(packet)
+            // First 2 bytes are the transaction id we set. Match ensures we
+            // didn't pick up some unrelated datagram that happened to land
+            // on the same port.
+            val ok = packet.length >= 2 &&
+                packet.data[0] == query[0] &&
+                packet.data[1] == query[1]
+            if (!ok) AppLog.w(TAG, "DNS probe: reply id mismatch (len=${packet.length})")
+            ok
+        } catch (e: Exception) {
+            AppLog.w(TAG, "DNS probe to $DNS_PROBE_ADDR:$DNS_PROBE_PORT failed: ${e.message}")
+            false
+        } finally {
+            runCatching { socket.close() }
+        }
+    }
+
+    private fun buildDnsQuery(host: String): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val dos = java.io.DataOutputStream(out)
+        val id = (System.nanoTime() and 0xFFFF).toInt()
+        dos.writeShort(id)
+        dos.writeShort(0x0100) // standard query, recursion desired
+        dos.writeShort(1)      // qdcount
+        dos.writeShort(0)      // ancount
+        dos.writeShort(0)      // nscount
+        dos.writeShort(0)      // arcount
+        for (label in host.split('.')) {
+            dos.writeByte(label.length)
+            dos.write(label.toByteArray(Charsets.US_ASCII))
+        }
+        dos.writeByte(0)       // root
+        dos.writeShort(1)      // QTYPE = A
+        dos.writeShort(1)      // QCLASS = IN
+        return out.toByteArray()
     }
 
     /**

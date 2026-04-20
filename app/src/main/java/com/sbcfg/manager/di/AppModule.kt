@@ -10,6 +10,7 @@ import com.sbcfg.manager.data.local.dao.AppRuleDao
 import com.sbcfg.manager.data.local.dao.CustomDomainDao
 import com.sbcfg.manager.data.local.dao.ServerConfigDao
 import com.sbcfg.manager.data.preferences.AppPreferences
+import com.sbcfg.manager.vpn.ProtectedSocketFactory
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -51,11 +52,19 @@ object AppModule {
     fun provideAppPreferences(dataStore: DataStore<Preferences>): AppPreferences =
         AppPreferences(dataStore)
 
+    // All app-level HTTP (config fetch, GitHub updates, APK download) must
+    // bypass the tunnel via ProtectedSocketFactory. The alternative —
+    // addDisallowedApplication(packageName) — was removed in v1.2.17 so that
+    // VpnHealthCheck can open real probe sockets through tun without EPERM.
+    // Any new HTTP client MUST reuse this singleton; a raw OkHttpClient
+    // created elsewhere will silently route through the VPN, which at best
+    // hurts latency and at worst (config fetch when VPN is broken) deadlocks.
     @Provides
     @Singleton
     fun provideOkHttpClient(): OkHttpClient =
         OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
+            .socketFactory(ProtectedSocketFactory())
             .build()
 }

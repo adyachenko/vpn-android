@@ -116,7 +116,7 @@ Button → ViewModel.onToggleVpn() → SideEffect.StopVpn
 - `useProcFS() = true` — SELinux блокирует netlink_route_socket
 - `basePath = filesDir` (internal storage) — external storage не поддерживает unix sockets на Android 11+
 - Адреса интерфейсов ОБЯЗАТЕЛЬНО с CIDR (`addr/prefix`) — Go паникует без prefix
-- Свой пакет исключаем из VPN: `addDisallowedApplication(packageName)`
+- Свой пакет **НЕ исключаем** целиком из VPN. С v1.2.17 app-уровень HTTP обходит тоннель per-socket через `ProtectedSocketFactory` (см. `vpn/ProtectedSocketFactory.kt`, `di/AppModule.kt`). В include-mode добавляем свой UID в allow-list, чтобы probe-сокеты `VpnHealthCheck` реально уходили через tun. **Любой новый сетевой клиент обязан брать OkHttpClient из DI** — иначе его сокеты пойдут через VPN (риск deadlock на фетче конфига).
 - `START_NOT_STICKY` — не перезапускать сервис при убийстве
 - DefaultNetworkMonitor: `registerBestMatchingNetworkCallback` (API 31+) или `requestNetwork` (API 28+)
 
