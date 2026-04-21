@@ -157,12 +157,32 @@ class VpnHealthCheck(
         // RETRY_INTERVAL_MS) matches — no point making one signal slower
         // than the others.
         private const val MAX_DNS_FAILURES = 2
+
+        // --- Connection failure detector (since v1.2.19) ---
+        // Monitors ConnectionEvents from libbox to detect intermittent QUIC
+        // degradation: the session is half-alive (urltest passes, DNS works)
+        // but real TCP streams get "connection refused" randomly.
+        private const val CONN_MONITOR_INTERVAL_MS = 1_000L
+        // Sliding window for counting failures.
+        private const val CONN_WINDOW_MS = 30_000L
+        // Minimum failed TCP connections (0 downlink, lifetime < 120s) in the
+        // window before triggering restart. 5 is high enough that a single
+        // broken CDN won't fire it, but low enough to catch the burst of
+        // refused connections we see during QUIC degradation (~20 in 90s).
+        private const val CONN_FAIL_THRESHOLD = 5
+        // Max connection lifetime to count as "failed". Longer-lived idle
+        // connections that close with 0 downlink are not failures.
+        private const val CONN_FAIL_MAX_LIFETIME_MS = 120_000L
+        // Only count connections through these outbounds.
+        private val PROXY_OUTBOUNDS = setOf("hysteria2-out", "naive-out")
     }
 
     private var job: Job? = null
     private var networkCheckJob: Job? = null
     private var statusJob: Job? = null
+    private var connectionMonitorJob: Job? = null
     private var statusClient: CommandClient? = null
+    private var connectionMonitorClient: CommandClient? = null
     private var tunnelFailures = 0
     private var dnsFailures = 0
 
@@ -234,6 +254,31 @@ class VpnHealthCheck(
                     delay(STATUS_RETRY_DELAY_MS)
                 } finally {
                     statusClient = null
+                    runCatching { client.disconnect() }
+                }
+            }
+        }
+        connectionMonitorJob = scope.launch(Dispatchers.IO) {
+            delay(INITIAL_DELAY_MS)
+            while (isActive) {
+                val detector = ConnectionFailureDetector()
+                val options = CommandClientOptions().apply {
+                    addCommand(Libbox.CommandConnections)
+                    statusInterval = CONN_MONITOR_INTERVAL_MS
+                }
+                val client = CommandClient(detector, options)
+                try {
+                    client.connect()
+                    connectionMonitorClient = client
+                    AppLog.i(TAG, "Connection monitor connected (window=${CONN_WINDOW_MS / 1000}s, threshold=$CONN_FAIL_THRESHOLD)")
+                    awaitCancellation()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    AppLog.w(TAG, "Connection monitor failed: ${e.message}")
+                    delay(STATUS_RETRY_DELAY_MS)
+                } finally {
+                    connectionMonitorClient = null
                     runCatching { client.disconnect() }
                 }
             }
@@ -379,8 +424,12 @@ class VpnHealthCheck(
         networkCheckJob = null
         statusJob?.cancel()
         statusJob = null
+        connectionMonitorJob?.cancel()
+        connectionMonitorJob = null
         runCatching { statusClient?.disconnect() }
         statusClient = null
+        runCatching { connectionMonitorClient?.disconnect() }
+        connectionMonitorClient = null
         tunnelFailures = 0
         dnsFailures = 0
         failures = 0
@@ -756,5 +805,87 @@ class VpnHealthCheck(
         override fun writeConnectionEvents(events: ConnectionEvents?) {}
         override fun writeLogs(logs: LogIterator?) {}
         override fun writeGroups(groups: OutboundGroupIterator?) {}
+    }
+
+    /**
+     * Detects intermittent QUIC session degradation by monitoring actual
+     * connection outcomes via libbox's ConnectionEvents stream.
+     *
+     * Stale QUIC sessions can be partially functional: urltest passes,
+     * DNS resolves, but real TCP streams randomly get "connection refused".
+     * Neither the probe() (urltest-based) nor TunnelStallDetector (TX/RX
+     * aggregate) can catch this — the intermittent successes mask the
+     * failure in aggregate metrics.
+     *
+     * This detector counts individual TCP connections through proxy
+     * outbounds that close with 0 bytes received (DownlinkTotal == 0)
+     * within a short lifetime — the exact signature of a refused/reset
+     * connection. When enough pile up in a sliding window, trigger restart.
+     */
+    private inner class ConnectionFailureDetector : CommandClientHandler {
+
+        private val failures = ArrayDeque<Long>()
+        private var logCounter = 0
+
+        override fun writeConnectionEvents(events: ConnectionEvents?) {
+            if (events == null) return
+            val iter = events.iterator()
+            while (iter.hasNext()) {
+                val event = iter.next()
+                if (event.type.toInt() != 2) continue // ConnectionEventClosed
+                val conn = event.connection ?: continue
+                if (conn.network != "tcp") continue
+                if (conn.outbound !in PROXY_OUTBOUNDS) continue
+
+                val lifetimeMs = event.closedAt - conn.createdAt
+                val failed = conn.downlinkTotal == 0L && lifetimeMs in 1 until CONN_FAIL_MAX_LIFETIME_MS
+
+                logCounter++
+                if (logCounter % 10 == 1 || failed) {
+                    AppLog.i(
+                        TAG,
+                        "conn-mon: ${conn.outbound} → ${conn.destination} " +
+                                "dl=${conn.downlinkTotal}B life=${lifetimeMs}ms " +
+                                if (failed) "FAIL" else "ok",
+                    )
+                }
+
+                if (!failed) continue
+
+                val now = System.currentTimeMillis()
+                failures.addLast(now)
+                evictOld(now)
+
+                if (failures.size >= CONN_FAIL_THRESHOLD) {
+                    if (now - lastStallRestartAt < MIN_STALL_RESTART_INTERVAL_MS) return
+                    lastStallRestartAt = now
+                    AppLog.e(
+                        TAG,
+                        "conn-mon DETECT: ${failures.size} failed proxy connections " +
+                                "in ${CONN_WINDOW_MS / 1000}s — restarting",
+                    )
+                    failures.clear()
+                    runCatching { onConnectivityLost() }
+                        .onFailure { AppLog.e(TAG, "conn-mon onConnectivityLost failed", it) }
+                }
+            }
+        }
+
+        private fun evictOld(now: Long) {
+            val cutoff = now - CONN_WINDOW_MS
+            while (failures.isNotEmpty() && failures.first() < cutoff) {
+                failures.removeFirst()
+            }
+        }
+
+        override fun clearLogs() {}
+        override fun connected() {}
+        override fun disconnected(message: String?) {}
+        override fun initializeClashMode(modes: StringIterator?, current: String?) {}
+        override fun setDefaultLogLevel(level: Int) {}
+        override fun updateClashMode(mode: String?) {}
+        override fun writeLogs(logs: LogIterator?) {}
+        override fun writeGroups(groups: OutboundGroupIterator?) {}
+        override fun writeStatus(status: StatusMessage?) {}
     }
 }
