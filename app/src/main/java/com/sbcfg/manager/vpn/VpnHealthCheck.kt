@@ -507,9 +507,11 @@ class VpnHealthCheck(
      * outbound urltest still reports healthy (see wiki §1.3a, issue #001).
      *
      * Problem: our process is excluded from the tunnel via
-     * addDisallowedApplication(packageName) — that means a DatagramSocket()
-     * created here routes via wlan0, NOT tun, and would either EPERM on
-     * bind to 172.19.0.1 or silently go to an address that doesn't answer.
+     * addDisallowedApplication(packageName). Even explicitly binding the
+     * socket to the VPN Network via Network.bindSocket() fails with
+     * `SocketException: Binding socket to network N failed: EPERM`
+     * (empirically confirmed 2026-04-20 on v1.2.18, Android, tun0 network
+     * id=364). So we cannot send a probe packet from this process, period.
      *
      * Attempting to flip the exclusion (v1.2.17 first pass) broke things
      * differently — WorkManager/Hilt/etc traffic poured into the tunnel on
@@ -517,9 +519,11 @@ class VpnHealthCheck(
      *
      * Leaving the code structure in place (ProbeResult.dnsAlive, handleProbeResult
      * branch, counters) so wiring is done when we find a real solution —
-     * likely a libbox command-channel DNS health endpoint, or binding this
-     * probe to the VPN Network via ConnectivityManager.getActiveNetwork().
-     * Until then, returning true means the DNS branch is never taken.
+     * the path is extending libbox with a CommandDNSTest that invokes the
+     * sing-box DNS router over the unix-socket command channel (same
+     * mechanism as URLTest and SelectOutbound, which already work from this
+     * excluded process). Until then, returning true means the DNS branch
+     * is never taken.
      */
     @Suppress("FunctionOnlyReturningConstant")
     private fun probeDns(): Boolean = true

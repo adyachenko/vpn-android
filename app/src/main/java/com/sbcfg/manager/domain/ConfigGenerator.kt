@@ -25,9 +25,11 @@ class ConfigGenerator @Inject constructor(
 
         val json = JSONObject(config.rawJson)
 
-        // Enable logging to file for debugging
+        // Enable logging to file for debugging.
+        // Temporary: level=debug to capture issue #001 (silent DNS handler
+        // death). Revert to "info" once the root cause is found.
         val log = json.optJSONObject("log") ?: JSONObject().also { json.put("log", it) }
-        log.put("level", "info")
+        log.put("level", "debug")
         log.put("output", "${context.filesDir.absolutePath}/sing-box.log")
 
         // Migrate legacy tun fields (removed in sing-box 1.12.0)
@@ -326,24 +328,31 @@ class ConfigGenerator @Inject constructor(
 
     /**
      * Ensure DNS servers going through proxy use DoH (not plain UDP).
-     * Naive proxy only supports TCP/HTTP — plain DNS (UDP) won't work through it.
+     * Naive proxy only supports TCP/HTTP — plain DNS over UDP won't work
+     * through it. Hysteria2 does carry UDP, but a half-dead QUIC session
+     * can black-hole DNS queries silently; DoH over TCP survives that case.
+     *
+     * Matches pure IP (`1.1.1.1`), explicit `udp://1.1.1.1`, and optional
+     * port suffix — all three forms would route as UDP. Already-DoH
+     * (`https://...`), DoT (`tls://...`), and TCP (`tcp://...`) addresses
+     * are left untouched.
      */
     private fun ensureDnsOverHttps(json: JSONObject) {
         val dns = json.optJSONObject("dns") ?: return
         val servers = dns.optJSONArray("servers") ?: return
-        val ipPattern = Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$""")
+        val udpIpPattern = Regex("""^(?:udp://)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::\d+)?$""")
 
         for (i in 0 until servers.length()) {
             val server = servers.getJSONObject(i)
             val detour = server.optString("detour")
             val address = server.optString("address")
+            if (detour.isEmpty() || detour.contains("direct")) continue
 
-            // If DNS goes through proxy and uses plain IP (not DoH/DoT), convert to DoH
-            if (detour.isNotEmpty() && !detour.contains("direct") && ipPattern.matches(address)) {
-                val dohAddress = "https://$address/dns-query"
-                server.put("address", dohAddress)
-                AppLog.i("ConfigGen", "Converted plain DNS $address to DoH $dohAddress for proxy detour")
-            }
+            val m = udpIpPattern.matchEntire(address) ?: continue
+            val ip = m.groupValues[1]
+            val dohAddress = "https://$ip/dns-query"
+            server.put("address", dohAddress)
+            AppLog.i("ConfigGen", "Converted UDP DNS $address to DoH $dohAddress for proxy detour")
         }
     }
 
