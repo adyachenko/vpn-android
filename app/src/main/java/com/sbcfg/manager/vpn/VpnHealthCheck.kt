@@ -93,6 +93,14 @@ class VpnHealthCheck(
         // Shorter risks unnecessary restarts on quick screen-peek patterns.
         private const val WAKE_RESET_THRESHOLD_MS = 15_000L
 
+        // --- Screen-off battery optimization ---
+        // Probe interval when screen is off — no user is looking, so slow
+        // cadence saves battery while still catching dead engines.
+        private const val SCREEN_OFF_CHECK_INTERVAL_MS = 120_000L
+        // Delay before disconnecting persistent detectors on screen-off.
+        // Prevents disconnect/reconnect churn on quick screen peeks.
+        private const val SCREEN_OFF_DETECTOR_DELAY_MS = 5_000L
+
         // --- TX/RX stall detector (active between probes) ---
         // How often libbox pushes StatusMessage to our persistent Status
         // subscriber. 1s matches sfa's dashboard and gives us sub-second
@@ -162,7 +170,6 @@ class VpnHealthCheck(
         // Monitors ConnectionEvents from libbox to detect intermittent QUIC
         // degradation: the session is half-alive (urltest passes, DNS works)
         // but real TCP streams get "connection refused" randomly.
-        private const val CONN_MONITOR_INTERVAL_MS = 1_000L
         // Sliding window for counting failures.
         private const val CONN_WINDOW_MS = 30_000L
         // Minimum failed TCP connections (0 downlink, lifetime < 120s) in the
@@ -179,10 +186,12 @@ class VpnHealthCheck(
 
     private var job: Job? = null
     private var networkCheckJob: Job? = null
-    private var statusJob: Job? = null
-    private var connectionMonitorJob: Job? = null
-    private var statusClient: CommandClient? = null
-    private var connectionMonitorClient: CommandClient? = null
+    private var detectorJob: Job? = null
+    private var detectorClient: CommandClient? = null
+    private var screenOffJob: Job? = null
+    @Volatile
+    private var screenOn: Boolean = true
+    private var activeScope: CoroutineScope? = null
     private var tunnelFailures = 0
     private var dnsFailures = 0
 
@@ -209,12 +218,19 @@ class VpnHealthCheck(
     fun start(scope: CoroutineScope) {
         stop()
         failures = 0
+        screenOn = true
+        activeScope = scope
         job = scope.launch(Dispatchers.IO) {
             AppLog.i(TAG, "Health check started (interval=${CHECK_INTERVAL_MS}ms, retry=${RETRY_INTERVAL_MS}ms, threshold=$MAX_FAILURES)")
             delay(INITIAL_DELAY_MS)
             while (isActive) {
                 handleProbeResult(probe())
-                val nextDelay = if (failures > 0 || tunnelFailures > 0 || dnsFailures > 0) RETRY_INTERVAL_MS else CHECK_INTERVAL_MS
+                val hasFailures = failures > 0 || tunnelFailures > 0 || dnsFailures > 0
+                val nextDelay = when {
+                    hasFailures -> RETRY_INTERVAL_MS
+                    !screenOn -> SCREEN_OFF_CHECK_INTERVAL_MS
+                    else -> CHECK_INTERVAL_MS
+                }
                 val signal = kotlinx.coroutines.CompletableDeferred<Unit>()
                 wakeSignal = signal
                 try {
@@ -224,65 +240,52 @@ class VpnHealthCheck(
                 }
             }
         }
-        // Persistent Status subscriber: independent channel that feeds the
-        // TX/RX stall detector between probe() ticks. Not part of probe()
-        // because probes are short-lived (600ms) and we need continuous
-        // traffic-counter deltas to catch a black-holed tunnel while apps
-        // are actively retrying — the scenario probe() itself cannot see.
-        statusJob = scope.launch(Dispatchers.IO) {
-            // Give libbox the same warm-up window as the main loop so we
-            // don't hammer an engine that's still binding its sockets.
-            delay(INITIAL_DELAY_MS)
+        startDetector(scope, initialDelay = true)
+    }
+
+    /**
+     * Launches a single persistent CommandClient subscribed to both
+     * CommandStatus (TX/RX stall detection) and CommandConnections
+     * (connection failure detection). One socket instead of two cuts
+     * wake events in half; pausing on screen-off eliminates them entirely.
+     */
+    private fun startDetector(scope: CoroutineScope, initialDelay: Boolean) {
+        stopDetector()
+        detectorJob = scope.launch(Dispatchers.IO) {
+            if (initialDelay) delay(INITIAL_DELAY_MS)
             while (isActive) {
-                val detector = TunnelStallDetector()
+                val stallDetector = TunnelStallDetector()
+                val connDetector = ConnectionFailureDetector()
+                val handler = CombinedDetectorHandler(stallDetector, connDetector)
                 val options = CommandClientOptions().apply {
                     addCommand(Libbox.CommandStatus)
+                    addCommand(Libbox.CommandConnections)
                     statusInterval = STATUS_PUSH_INTERVAL_MS
                 }
-                val client = CommandClient(detector, options)
+                val client = CommandClient(handler, options)
                 try {
                     client.connect()
-                    statusClient = client
-                    AppLog.i(TAG, "Status subscription connected (interval=${STATUS_PUSH_INTERVAL_MS}ms)")
-                    // Block until this scope is cancelled — the handler
-                    // pushes updates on the libbox push thread.
+                    detectorClient = client
+                    AppLog.i(TAG, "Combined detector connected (status+connections, interval=${STATUS_PUSH_INTERVAL_MS}ms)")
                     awaitCancellation()
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    AppLog.w(TAG, "Status subscription failed: ${e.message}")
+                    AppLog.w(TAG, "Combined detector failed: ${e.message}")
                     delay(STATUS_RETRY_DELAY_MS)
                 } finally {
-                    statusClient = null
+                    detectorClient = null
                     runCatching { client.disconnect() }
                 }
             }
         }
-        connectionMonitorJob = scope.launch(Dispatchers.IO) {
-            delay(INITIAL_DELAY_MS)
-            while (isActive) {
-                val detector = ConnectionFailureDetector()
-                val options = CommandClientOptions().apply {
-                    addCommand(Libbox.CommandConnections)
-                    statusInterval = CONN_MONITOR_INTERVAL_MS
-                }
-                val client = CommandClient(detector, options)
-                try {
-                    client.connect()
-                    connectionMonitorClient = client
-                    AppLog.i(TAG, "Connection monitor connected (window=${CONN_WINDOW_MS / 1000}s, threshold=$CONN_FAIL_THRESHOLD)")
-                    awaitCancellation()
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    AppLog.w(TAG, "Connection monitor failed: ${e.message}")
-                    delay(STATUS_RETRY_DELAY_MS)
-                } finally {
-                    connectionMonitorClient = null
-                    runCatching { client.disconnect() }
-                }
-            }
-        }
+    }
+
+    private fun stopDetector() {
+        detectorJob?.cancel()
+        detectorJob = null
+        runCatching { detectorClient?.disconnect() }
+        detectorClient = null
     }
 
     private fun handleProbeResult(result: ProbeResult) {
@@ -375,6 +378,14 @@ class VpnHealthCheck(
      */
     fun onScreenOff() {
         lastScreenOffAt = System.currentTimeMillis()
+        screenOn = false
+        val scope = activeScope ?: return
+        screenOffJob?.cancel()
+        screenOffJob = scope.launch(Dispatchers.IO) {
+            delay(SCREEN_OFF_DETECTOR_DELAY_MS)
+            AppLog.i(TAG, "Screen off — pausing detectors to save battery")
+            stopDetector()
+        }
     }
 
     /**
@@ -394,7 +405,18 @@ class VpnHealthCheck(
      *   only a full stop→start rebinds sockets and tears down stale QUIC.
      */
     fun onWakeFromSleep(scope: CoroutineScope) {
-        if (lastSelectorSelected == null) return
+        screenOn = true
+        screenOffJob?.cancel()
+        screenOffJob = null
+        if (detectorJob == null || detectorJob?.isActive != true) {
+            AppLog.i(TAG, "Resuming detectors after screen-on")
+            startDetector(scope, initialDelay = false)
+        }
+
+        if (lastSelectorSelected == null) {
+            wakeSignal?.complete(Unit)
+            return
+        }
 
         val off = lastScreenOffAt
         val sleepMs = if (off > 0L) System.currentTimeMillis() - off else 0L
@@ -422,19 +444,16 @@ class VpnHealthCheck(
         job = null
         networkCheckJob?.cancel()
         networkCheckJob = null
-        statusJob?.cancel()
-        statusJob = null
-        connectionMonitorJob?.cancel()
-        connectionMonitorJob = null
-        runCatching { statusClient?.disconnect() }
-        statusClient = null
-        runCatching { connectionMonitorClient?.disconnect() }
-        connectionMonitorClient = null
+        screenOffJob?.cancel()
+        screenOffJob = null
+        stopDetector()
         tunnelFailures = 0
         dnsFailures = 0
         failures = 0
         lastScreenOffAt = 0L
         lastStallRestartAt = 0L
+        screenOn = true
+        activeScope = null
         HealthMetrics.clear()
     }
 
@@ -661,6 +680,22 @@ class VpnHealthCheck(
         override fun writeConnectionEvents(events: ConnectionEvents?) {}
         override fun writeLogs(logs: LogIterator?) {}
         override fun writeStatus(status: StatusMessage?) {}
+    }
+
+    private inner class CombinedDetectorHandler(
+        private val stallDetector: TunnelStallDetector,
+        private val connDetector: ConnectionFailureDetector,
+    ) : CommandClientHandler {
+        override fun writeStatus(status: StatusMessage?) = stallDetector.writeStatus(status)
+        override fun writeConnectionEvents(events: ConnectionEvents?) = connDetector.writeConnectionEvents(events)
+        override fun clearLogs() {}
+        override fun connected() {}
+        override fun disconnected(message: String?) {}
+        override fun initializeClashMode(modes: StringIterator?, current: String?) {}
+        override fun setDefaultLogLevel(level: Int) {}
+        override fun updateClashMode(mode: String?) {}
+        override fun writeLogs(logs: LogIterator?) {}
+        override fun writeGroups(groups: OutboundGroupIterator?) {}
     }
 
     /**
