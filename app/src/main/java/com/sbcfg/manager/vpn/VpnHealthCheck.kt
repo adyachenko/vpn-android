@@ -13,6 +13,7 @@ import io.nekohasekai.libbox.OutboundGroupIterator
 import io.nekohasekai.libbox.StatusMessage
 import io.nekohasekai.libbox.StringIterator
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,6 +21,7 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Watchdog that verifies both that the sing-box engine is alive AND that the
@@ -58,7 +60,7 @@ import kotlinx.coroutines.launch
 class VpnHealthCheck(
     @Suppress("unused") private val connectivityManager: ConnectivityManager,
     private val onUnhealthy: () -> Unit,
-    private val onConnectivityLost: () -> Unit
+    private val onConnectivityLost: (force: Boolean) -> Unit
 ) {
     companion object {
         private const val TAG = "VpnHealthCheck"
@@ -92,6 +94,7 @@ class VpnHealthCheck(
         // which rip TCP sockets well before the typical 30–60s UDP timeout.
         // Shorter risks unnecessary restarts on quick screen-peek patterns.
         private const val WAKE_RESET_THRESHOLD_MS = 15_000L
+        private const val WAKE_RESTART_COOLDOWN_MS = 120_000L
 
         // --- Screen-off battery optimization ---
         // Probe interval when screen is off — no user is looking, so slow
@@ -197,6 +200,8 @@ class VpnHealthCheck(
 
     @Volatile
     private var lastStallRestartAt: Long = 0L
+    @Volatile
+    private var lastRestartRequestAt: Long = 0L
 
     @Volatile
     private var lastSelectorSelected: String? = null
@@ -213,7 +218,7 @@ class VpnHealthCheck(
     // its current delay — used after an out-of-band probe so the next tick
     // lands in line with the adaptive interval policy.
     @Volatile
-    private var wakeSignal: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+    private var wakeSignal: CompletableDeferred<Unit>? = null
 
     fun start(scope: CoroutineScope) {
         stop()
@@ -231,10 +236,10 @@ class VpnHealthCheck(
                     !screenOn -> SCREEN_OFF_CHECK_INTERVAL_MS
                     else -> CHECK_INTERVAL_MS
                 }
-                val signal = kotlinx.coroutines.CompletableDeferred<Unit>()
+                val signal = CompletableDeferred<Unit>()
                 wakeSignal = signal
                 try {
-                    kotlinx.coroutines.withTimeoutOrNull(nextDelay) { signal.await() }
+                    withTimeoutOrNull(nextDelay) { signal.await() }
                 } finally {
                     wakeSignal = null
                 }
@@ -318,7 +323,8 @@ class VpnHealthCheck(
                 if (tunnelFailures >= MAX_TUNNEL_FAILURES) {
                     AppLog.e(TAG, "Tunnel dead — triggering VPN restart")
                     tunnelFailures = 0
-                    runCatching { onConnectivityLost() }
+                    lastRestartRequestAt = System.currentTimeMillis()
+                    runCatching { onConnectivityLost(false) }
                         .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
                 }
             }
@@ -337,7 +343,8 @@ class VpnHealthCheck(
                 if (dnsFailures >= MAX_DNS_FAILURES) {
                     AppLog.e(TAG, "DNS handler dead — triggering VPN restart")
                     dnsFailures = 0
-                    runCatching { onConnectivityLost() }
+                    lastRestartRequestAt = System.currentTimeMillis()
+                    runCatching { onConnectivityLost(false) }
                         .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
                 }
             }
@@ -365,7 +372,8 @@ class VpnHealthCheck(
             if (result.libboxAlive && !result.outboundHealthy) {
                 AppLog.e(TAG, "Post-network-change: outbounds still timing out — restarting VPN")
                 tunnelFailures = 0
-                runCatching { onConnectivityLost() }
+                lastRestartRequestAt = System.currentTimeMillis()
+                runCatching { onConnectivityLost(false) }
                     .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
             }
         }
@@ -424,9 +432,17 @@ class VpnHealthCheck(
         networkCheckJob?.cancel()
         networkCheckJob = scope.launch(Dispatchers.IO) {
             if (sleepMs >= WAKE_RESET_THRESHOLD_MS) {
+                val sinceLastRestart = System.currentTimeMillis() - lastRestartRequestAt
+                if (lastRestartRequestAt > 0 && sinceLastRestart < WAKE_RESTART_COOLDOWN_MS) {
+                    AppLog.i(TAG, "Screen on after ${sleepMs}ms — skipping restart, detector restarted ${sinceLastRestart / 1000}s ago")
+                    handleProbeResult(probe())
+                    wakeSignal?.complete(Unit)
+                    return@launch
+                }
                 AppLog.i(TAG, "Screen on after ${sleepMs}ms — restarting VPN to drop stale QUIC/TCP")
                 tunnelFailures = 0
-                runCatching { onConnectivityLost() }
+                lastRestartRequestAt = System.currentTimeMillis()
+                runCatching { onConnectivityLost(false) }
                     .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
                 return@launch
             }
@@ -452,6 +468,7 @@ class VpnHealthCheck(
         failures = 0
         lastScreenOffAt = 0L
         lastStallRestartAt = 0L
+        lastRestartRequestAt = 0L
         screenOn = true
         activeScope = null
         HealthMetrics.clear()
@@ -799,16 +816,15 @@ class VpnHealthCheck(
                     return
                 }
                 lastStallRestartAt = now
+                lastRestartRequestAt = now
                 AppLog.e(
                     TAG,
                     "rx-watcher DETECT: tunnel stalled " +
-                            "(tx=${sumTx}B, rx=${sumRx}B over ${window.size} ticks) — restarting",
+                            "(tx=${sumTx}B, rx=${sumRx}B over ${window.size} ticks) — force restarting",
                 )
-                // Reset the local window so we don't re-trigger until we've
-                // seen fresh data through the new tunnel.
                 window.clear()
                 consecutiveSuspicious = 0
-                runCatching { onConnectivityLost() }
+                runCatching { onConnectivityLost(true) }
                     .onFailure { AppLog.e(TAG, "rx-watcher onConnectivityLost failed", it) }
             }
         }
@@ -894,13 +910,14 @@ class VpnHealthCheck(
                 if (failures.size >= CONN_FAIL_THRESHOLD) {
                     if (now - lastStallRestartAt < MIN_STALL_RESTART_INTERVAL_MS) return
                     lastStallRestartAt = now
+                    lastRestartRequestAt = now
                     AppLog.e(
                         TAG,
                         "conn-mon DETECT: ${failures.size} failed proxy connections " +
                                 "in ${CONN_WINDOW_MS / 1000}s — restarting",
                     )
                     failures.clear()
-                    runCatching { onConnectivityLost() }
+                    runCatching { onConnectivityLost(false) }
                         .onFailure { AppLog.e(TAG, "conn-mon onConnectivityLost failed", it) }
                 }
             }

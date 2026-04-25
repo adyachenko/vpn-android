@@ -65,10 +65,14 @@ object BoxService : CommandServerHandler {
     // so the post-closeService() teardown steps (close/notify/stopSelf/status)
     // don't execute against a successor instance spawned by restart().
     private var stopJob: Job? = null
+    private var uptimeJob: Job? = null
 
     @Volatile
     private var lastConnectivityRestart: Long = 0
     private const val MIN_RESTART_INTERVAL_MS = 60_000L
+    private const val MAX_FORCE_RESTARTS = 2
+    @Volatile
+    private var consecutiveForceRestarts: Int = 0
 
     @Volatile
     private var lastNetworkRestart: Long = 0
@@ -106,7 +110,7 @@ object BoxService : CommandServerHandler {
         }
     }
 
-    fun stop() {
+    fun stop(quiet: Boolean = false) {
         AppLog.i(TAG, "stop() called, current status=${status.value}")
         val currentService = service
         if (currentService == null) {
@@ -120,6 +124,7 @@ object BoxService : CommandServerHandler {
         status.postValue(Status.Stopping)
         AppLog.i(TAG, "Status set to Stopping")
         stopHealthCheck()
+        stopUptimeUpdater()
         // Capture all mutable refs up-front. closeService() is a blocking Go call
         // that can outlive RESTART_STOP_TIMEOUT_MS; by the time this coroutine
         // resumes after it, restart() may already have spawned a successor
@@ -173,13 +178,8 @@ object BoxService : CommandServerHandler {
                 AppLog.e(TAG, "CommandServer close error", e)
             }
 
-            // 4. Remove foreground notification only after engine is fully stopped.
-            // Moving this after closeService() is critical: stopForeground() drops
-            // the service priority, and without a foreground Activity (e.g. when
-            // stopping from the QS tile) the system may kill the process before the
-            // engine releases its dup'd TUN fd — leaving the VPN icon stuck.
             withContext(Dispatchers.Main) {
-                localNotification?.close()
+                if (quiet) localNotification?.close() else localNotification?.closeStopped()
             }
 
             // 5. Stop Android service
@@ -227,8 +227,10 @@ object BoxService : CommandServerHandler {
             AppLog.w(TAG, "restart() while $currentStatus — skipping to avoid double-transition")
             return
         }
+        stopUptimeUpdater()
+        notification?.update("Переподключение...")
         GlobalScope.launch(Dispatchers.Main) {
-            stop()
+            stop(quiet = true)
             // Wait for the engine to actually shut down before re-creating it.
             val deadline = System.currentTimeMillis() + RESTART_STOP_TIMEOUT_MS
             while (status.value != Status.Stopped && System.currentTimeMillis() < deadline) {
@@ -262,6 +264,7 @@ object BoxService : CommandServerHandler {
         // touching the successor instance.
         stopJob?.cancel()
         stopJob = null
+        stopUptimeUpdater()
         commandServer = null
         service = null
         vpnService = null
@@ -323,7 +326,8 @@ object BoxService : CommandServerHandler {
                     startedAt = System.currentTimeMillis()
                     status.postValue(Status.Started)
                     AppLog.i(TAG, "Status set to Started, startedAt=$startedAt")
-                    notification?.show("VPN подключён")
+                    notification?.update("VPN подключён")
+                    startUptimeUpdater()
                     binder?.broadcast(Status.Started)
                     startHealthCheck()
                 }
@@ -339,6 +343,7 @@ object BoxService : CommandServerHandler {
     internal fun onServiceDestroy() {
         AppLog.i(TAG, "onServiceDestroy()")
         stopHealthCheck()
+        stopUptimeUpdater()
         try {
             commandServer?.closeService()
         } catch (_: Exception) {}
@@ -346,7 +351,7 @@ object BoxService : CommandServerHandler {
             commandServer?.close()
         } catch (_: Exception) {}
         commandServer = null
-        notification?.close()
+        notification?.remove()
         notification = null
         service = null
         vpnService = null
@@ -375,6 +380,35 @@ object BoxService : CommandServerHandler {
         healthCheck = null
         healthScope?.cancel()
         healthScope = null
+    }
+
+    private fun startUptimeUpdater() {
+        stopUptimeUpdater()
+        uptimeJob = GlobalScope.launch(Dispatchers.Main) {
+            while (isActive) {
+                delay(60_000)
+                val ts = startedAt ?: break
+                notification?.update("VPN подключён · ${formatUptime(ts)}")
+            }
+        }
+    }
+
+    private fun stopUptimeUpdater() {
+        uptimeJob?.cancel()
+        uptimeJob = null
+    }
+
+    private fun formatUptime(startedAt: Long): String {
+        val elapsed = System.currentTimeMillis() - startedAt
+        val minutes = ((elapsed / 60_000) % 60).toInt()
+        val hours = ((elapsed / 3_600_000) % 24).toInt()
+        val days = (elapsed / 86_400_000).toInt()
+        return when {
+            days > 0 -> "${days}д ${hours}ч"
+            hours > 0 -> "${hours}ч ${minutes}м"
+            minutes > 0 -> "${minutes} мин"
+            else -> "< 1 мин"
+        }
     }
 
     /**
@@ -432,19 +466,27 @@ object BoxService : CommandServerHandler {
      * the VPN network) fails repeatedly. Does a full VPN restart because a
      * dead Hysteria2 UDP outbound is only recoverable by rebinding sockets.
      */
-    private fun onConnectivityLost() {
+    private fun onConnectivityLost(force: Boolean = false) {
         if (status.value != Status.Started) {
-            // Orphan health check firing against a torn-down (or superseded)
-            // BoxService. Kill it and bail — any real recovery goes through
-            // a fresh start() which will spin up its own health check.
             AppLog.w(TAG, "Skipping connectivity restart — status=${status.value}, stopping stale health check")
             stopHealthCheck()
             return
         }
         val now = System.currentTimeMillis()
-        if (now - lastConnectivityRestart < MIN_RESTART_INTERVAL_MS) {
-            AppLog.w(TAG, "Skipping connectivity restart — last restart was ${(now - lastConnectivityRestart) / 1000}s ago")
-            return
+        val elapsed = now - lastConnectivityRestart
+        val cooldownActive = elapsed < MIN_RESTART_INTERVAL_MS
+
+        if (cooldownActive) {
+            if (force && consecutiveForceRestarts < MAX_FORCE_RESTARTS) {
+                consecutiveForceRestarts++
+                AppLog.w(TAG, "Force restart #$consecutiveForceRestarts bypassing ${elapsed / 1000}s cooldown")
+            } else {
+                AppLog.w(TAG, "Skipping connectivity restart — last restart was ${elapsed / 1000}s ago" +
+                    if (force) " (force limit reached)" else "")
+                return
+            }
+        } else {
+            consecutiveForceRestarts = 0
         }
         lastConnectivityRestart = now
 
