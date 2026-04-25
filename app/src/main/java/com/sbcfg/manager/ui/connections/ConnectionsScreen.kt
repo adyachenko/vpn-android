@@ -122,6 +122,7 @@ class ConnectionsViewModel @Inject constructor() : ViewModel() {
     private val trafficHistory = mutableMapOf<String, TrafficEntry>()
     private var lastPollTime: Long = System.currentTimeMillis()
     private var pollJob: Job? = null
+    private var loggedClientNull = false
 
     init {
         startPolling()
@@ -129,10 +130,12 @@ class ConnectionsViewModel @Inject constructor() : ViewModel() {
 
     fun startPolling() {
         if (pollJob?.isActive == true) return
+        loggedClientNull = false
         pollJob = viewModelScope.launch {
             while (true) {
                 poll()
-                delay(POLL_INTERVAL_MS)
+                val interval = if (BoxService.clashClient == null) 5_000L else POLL_INTERVAL_MS
+                delay(interval)
             }
         }
         AppLog.i(TAG, "Polling started")
@@ -168,8 +171,15 @@ class ConnectionsViewModel @Inject constructor() : ViewModel() {
     private suspend fun poll() {
         val client = BoxService.clashClient
         if (client == null) {
-            AppLog.w(TAG, "poll: clashClient is null, skipping")
+            if (!loggedClientNull) {
+                AppLog.w(TAG, "poll: clashClient is null, waiting for VPN start")
+                loggedClientNull = true
+            }
             return
+        }
+        if (loggedClientNull) {
+            AppLog.i(TAG, "poll: clashClient available, resuming")
+            loggedClientNull = false
         }
 
         val snapshot = try {
