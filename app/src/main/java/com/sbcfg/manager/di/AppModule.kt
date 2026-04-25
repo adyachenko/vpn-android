@@ -10,6 +10,7 @@ import com.sbcfg.manager.data.local.dao.AppRuleDao
 import com.sbcfg.manager.data.local.dao.CustomDomainDao
 import com.sbcfg.manager.data.local.dao.ServerConfigDao
 import com.sbcfg.manager.data.preferences.AppPreferences
+import com.sbcfg.manager.speedtest.SpeedTestDao
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -40,6 +41,9 @@ object AppModule {
 
     @Provides
     fun provideAppRuleDao(db: AppDatabase): AppRuleDao = db.appRuleDao()
+
+    @Provides
+    fun provideSpeedTestDao(db: AppDatabase): SpeedTestDao = db.speedTestDao()
 
     @Provides
     @Singleton

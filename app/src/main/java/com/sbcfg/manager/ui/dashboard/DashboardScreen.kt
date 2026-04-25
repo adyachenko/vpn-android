@@ -59,6 +59,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.runtime.livedata.observeAsState
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -66,7 +70,6 @@ import com.sbcfg.manager.constant.Status
 import com.sbcfg.manager.domain.model.ConfigState
 import com.sbcfg.manager.ui.main.MainViewModel
 import com.sbcfg.manager.ui.main.SideEffect
-import com.sbcfg.manager.util.AppLog
 import com.sbcfg.manager.vpn.BoxService
 import kotlinx.coroutines.delay
 
@@ -75,6 +78,8 @@ import kotlinx.coroutines.delay
 fun DashboardScreen(
     viewModel: MainViewModel = hiltViewModel(),
     onOpenSettings: () -> Unit = {},
+    onOpenSpeedTest: () -> Unit = {},
+    onOpenConnections: () -> Unit = {},
     onStartVpn: (configJson: String?) -> Unit = {},
     onStopVpn: () -> Unit = {}
 ) {
@@ -172,8 +177,153 @@ fun DashboardScreen(
                     modifier = Modifier.padding(16.dp)
                 )
             }
+
+            if (vpnStatus == Status.Started) {
+                Spacer(Modifier.height(12.dp))
+                TrafficWidget(onClick = onOpenConnections)
+            }
+
+            Spacer(Modifier.height(12.dp))
+            SpeedWidget(onOpenSpeedTest = onOpenSpeedTest)
         }
     }
+}
+
+@Composable
+private fun TrafficWidget(onClick: () -> Unit = {}) {
+    val data by BoxService.trafficSnapshot.observeAsState()
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        val snapshot = data
+        if (snapshot != null) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    TrafficStat(
+                        icon = Icons.Filled.ArrowUpward,
+                        label = "Upload",
+                        value = formatBytes(snapshot.uploadTotal),
+                        color = MaterialTheme.colorScheme.tertiary
+                    )
+                    TrafficStat(
+                        icon = Icons.Filled.ArrowDownward,
+                        label = "Download",
+                        value = formatBytes(snapshot.downloadTotal),
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    TrafficStat(
+                        icon = Icons.Filled.Link,
+                        label = "Conns",
+                        value = snapshot.activeConnections.toString(),
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                }
+            }
+        } else {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "Loading traffic...",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TrafficStat(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    value: String,
+    color: Color
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = color,
+            modifier = Modifier.size(18.dp)
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = value,
+            fontWeight = FontWeight.Bold,
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Text(
+            text = label,
+            fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun SpeedWidget(onOpenSpeedTest: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpenSpeedTest),
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Filled.Speed,
+                    contentDescription = "Speed Test",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    text = "Speed Test",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Text(
+                text = "Tap to test",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes <= 0) return "0 B"
+    if (bytes < 1024) return "$bytes B"
+    if (bytes < 1024 * 1024) return "%.1f KB".format(bytes / 1024.0)
+    if (bytes < 1024 * 1024 * 1024) return "%.1f MB".format(bytes / (1024.0 * 1024))
+    return "%.2f GB".format(bytes / (1024.0 * 1024 * 1024))
 }
 
 @Composable

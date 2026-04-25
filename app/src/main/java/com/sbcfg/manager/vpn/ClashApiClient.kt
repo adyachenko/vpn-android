@@ -1,0 +1,153 @@
+package com.sbcfg.manager.vpn
+
+import com.sbcfg.manager.util.AppLog
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+private const val TAG = "ClashApiClient"
+
+data class TrafficSnapshot(
+    val uploadTotal: Long,
+    val downloadTotal: Long,
+    val activeConnections: Int,
+    val memory: Long,
+    val byOutbound: Map<String, OutboundTraffic>,
+)
+
+data class OutboundTraffic(
+    val name: String,
+    val upload: Long,
+    val download: Long,
+    val connectionCount: Int,
+)
+
+data class ConnectionsSnapshot(
+    val uploadTotal: Long,
+    val downloadTotal: Long,
+    val connections: List<ConnectionInfo>,
+)
+
+data class ConnectionInfo(
+    val host: String,
+    val destinationPort: Int,
+    val network: String,
+    val chain: String,
+    val rule: String,
+    val upload: Long,
+    val download: Long,
+    val start: String,
+    val process: String,
+)
+
+class ClashApiClient(
+    private val baseUrl: String = "http://127.0.0.1:9090",
+    private val secret: String = "",
+) {
+    private fun getRawBody(path: String): String {
+        val url = URL("$baseUrl$path")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.connectTimeout = 3_000
+        conn.readTimeout = 5_000
+        conn.setRequestProperty("Accept", "application/json")
+        if (secret.isNotEmpty()) {
+            conn.setRequestProperty("Authorization", "Bearer $secret")
+        }
+        try {
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val errBody = try { conn.errorStream?.bufferedReader()?.readText() } catch (_: Exception) { null }
+                throw IllegalStateException("HTTP $code for $path: $errBody")
+            }
+            return conn.inputStream.bufferedReader().readText()
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    fun fetchConnections(): ConnectionsSnapshot {
+        val body = getRawBody("/connections")
+        val root = JSONObject(body)
+        val uploadTotal = root.optLong("uploadTotal", 0L)
+        val downloadTotal = root.optLong("downloadTotal", 0L)
+        val connsArray = root.optJSONArray("connections")
+        val connections = mutableListOf<ConnectionInfo>()
+        if (connsArray != null) {
+            for (i in 0 until connsArray.length()) {
+                val obj = connsArray.getJSONObject(i)
+                val meta = obj.optJSONObject("metadata") ?: JSONObject()
+                val chainsArray = obj.optJSONArray("chains")
+                val chain = if (chainsArray != null && chainsArray.length() > 0) {
+                    chainsArray.getString(0)
+                } else {
+                    ""
+                }
+                val portStr = meta.optString("destinationPort", "0")
+                val port = portStr.toIntOrNull() ?: 0
+                connections.add(
+                    ConnectionInfo(
+                        host = meta.optString("host", ""),
+                        destinationPort = port,
+                        network = meta.optString("network", ""),
+                        chain = chain,
+                        rule = obj.optString("rule", ""),
+                        upload = obj.optLong("upload", 0L),
+                        download = obj.optLong("download", 0L),
+                        start = obj.optString("start", ""),
+                        process = meta.optString("processPath", ""),
+                    )
+                )
+            }
+        }
+        return ConnectionsSnapshot(
+            uploadTotal = uploadTotal,
+            downloadTotal = downloadTotal,
+            connections = connections,
+        )
+    }
+
+    fun fetchMemory(): Long {
+        val body = getRawBody("/memory")
+        val root = JSONObject(body)
+        return root.optLong("inuse", 0L)
+    }
+
+    fun fetchVersion(): String = getRawBody("/version")
+
+    fun fetchTrafficSnapshot(): TrafficSnapshot {
+        val snapshot = fetchConnections()
+        val memory = 0L // /memory is a streaming endpoint — can't read with simple HTTP GET
+
+        // Aggregate per-outbound traffic from the first chain element of each connection
+        val outboundMap = mutableMapOf<String, MutableOutboundAccumulator>()
+        for (conn in snapshot.connections) {
+            val outboundName = conn.chain.ifEmpty { "unknown" }
+            val acc = outboundMap.getOrPut(outboundName) { MutableOutboundAccumulator(outboundName) }
+            acc.upload += conn.upload
+            acc.download += conn.download
+            acc.connectionCount++
+        }
+
+        return TrafficSnapshot(
+            uploadTotal = snapshot.uploadTotal,
+            downloadTotal = snapshot.downloadTotal,
+            activeConnections = snapshot.connections.size,
+            memory = memory,
+            byOutbound = outboundMap.mapValues { (_, acc) ->
+                OutboundTraffic(
+                    name = acc.name,
+                    upload = acc.upload,
+                    download = acc.download,
+                    connectionCount = acc.connectionCount,
+                )
+            },
+        )
+    }
+
+    private data class MutableOutboundAccumulator(
+        val name: String,
+        var upload: Long = 0L,
+        var download: Long = 0L,
+        var connectionCount: Int = 0,
+    )
+}

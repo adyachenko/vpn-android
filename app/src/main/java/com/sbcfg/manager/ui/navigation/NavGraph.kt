@@ -6,9 +6,11 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.sbcfg.manager.ui.connections.ConnectionsScreen
 import com.sbcfg.manager.ui.dashboard.DashboardScreen
 import com.sbcfg.manager.ui.settings.SettingsScreen
 import com.sbcfg.manager.ui.setup.SetupScreen
+import com.sbcfg.manager.ui.speedtest.SpeedTestScreen
 
 @Composable
 fun NavGraph(
@@ -57,9 +59,17 @@ fun NavGraph(
         composable("dashboard") {
             DashboardScreen(
                 onOpenSettings = { navController.navigate("settings") },
+                onOpenSpeedTest = { navController.navigate("speedtest") },
+                onOpenConnections = { navController.navigate("connections") },
                 onStartVpn = onStartVpn,
                 onStopVpn = onStopVpn
             )
+        }
+        composable("connections") {
+            ConnectionsScreen(onNavigateBack = { navController.popBackStack() })
+        }
+        composable("speedtest") {
+            SpeedTestScreen(onBack = { navController.popBackStack() })
         }
         composable("settings") {
             SettingsScreen(

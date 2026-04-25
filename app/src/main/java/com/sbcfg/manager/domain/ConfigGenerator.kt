@@ -105,6 +105,9 @@ class ConfigGenerator @Inject constructor(
             addProxyAppsRule(json, proxyApps)
         }
 
+        // Enable Clash API for traffic monitoring (localhost only)
+        ensureClashApi(json)
+
         val result = json.toString(2)
         AppLog.i("ConfigGen", "Config generated, length=${result.length}")
         return result
@@ -556,6 +559,23 @@ class ConfigGenerator @Inject constructor(
      * Insert a route rule that forces all traffic from given packages to the proxy outbound.
      * Placed at the top of route.rules so it overrides domain-based rules.
      */
+    private fun ensureClashApi(json: JSONObject) {
+        val experimental = json.optJSONObject("experimental") ?: JSONObject().also {
+            json.put("experimental", it)
+        }
+        val clashApi = experimental.optJSONObject("clash_api") ?: JSONObject().also {
+            experimental.put("clash_api", it)
+        }
+        // Random port each start to avoid "address already in use" when a
+        // previous sing-box process hasn't released the port yet (Hysteria2
+        // QUIC shutdown can hang for 200+ seconds).
+        val port = 10000 + (System.nanoTime() % 50000).toInt().let { if (it < 0) -it else it }
+        clashApi.put("external_controller", "127.0.0.1:$port")
+        // Secret disabled for now — sing-box may hang on auth header
+        clashApi.remove("secret")
+        AppLog.i("ConfigGen", "Clash API enabled on 127.0.0.1:$port")
+    }
+
     private fun addProxyAppsRule(json: JSONObject, packageNames: List<String>) {
         val route = json.getJSONObject("route")
         val rules = route.optJSONArray("rules") ?: JSONArray().also { route.put("rules", it) }

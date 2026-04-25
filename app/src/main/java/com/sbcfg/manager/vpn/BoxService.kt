@@ -14,7 +14,9 @@ import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
 import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.SystemProxyStatus
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
@@ -65,7 +67,13 @@ object BoxService : CommandServerHandler {
     // so the post-closeService() teardown steps (close/notify/stopSelf/status)
     // don't execute against a successor instance spawned by restart().
     private var stopJob: Job? = null
+    private var stopDeferred: CompletableDeferred<Unit>? = null
     private var uptimeJob: Job? = null
+    private var clashHealthMonitor: ClashHealthMonitor? = null
+    var clashClient: ClashApiClient? = null
+        private set
+
+    val trafficSnapshot = MutableLiveData<TrafficSnapshot?>(null)
 
     @Volatile
     private var lastConnectivityRestart: Long = 0
@@ -115,10 +123,12 @@ object BoxService : CommandServerHandler {
         val currentService = service
         if (currentService == null) {
             AppLog.w(TAG, "stop() but service is null")
+            stopDeferred?.complete(Unit)
             return
         }
         if (status.value != Status.Started) {
             AppLog.w(TAG, "stop() but status is ${status.value}, not Started")
+            stopDeferred?.complete(Unit)
             return
         }
         status.postValue(Status.Stopping)
@@ -187,9 +197,18 @@ object BoxService : CommandServerHandler {
                 AppLog.i(TAG, "stopSelf()")
                 startedAt = null
                 status.postValue(Status.Stopped)
+                stopDeferred?.complete(Unit)
+                stopDeferred = null
                 currentService.stopSelf()
             }
         }
+    }
+
+    suspend fun stopAndAwait(quiet: Boolean = false) {
+        val deferred = CompletableDeferred<Unit>()
+        stopDeferred = deferred
+        stop(quiet)
+        deferred.await()
     }
 
     fun reload(configContent: String) {
@@ -264,6 +283,8 @@ object BoxService : CommandServerHandler {
         // touching the successor instance.
         stopJob?.cancel()
         stopJob = null
+        stopDeferred?.complete(Unit)
+        stopDeferred = null
         stopUptimeUpdater()
         commandServer = null
         service = null
@@ -271,6 +292,8 @@ object BoxService : CommandServerHandler {
         notification = null
         binder = null
         startedAt = null
+        clashClient = null
+        clashHealthMonitor = null
         status.postValue(Status.Stopped)
     }
 
@@ -373,11 +396,30 @@ object BoxService : CommandServerHandler {
         ).also {
             it.start(scope)
         }
+
+        // Parse Clash API endpoint from config and start monitoring
+        val (baseUrl, secret) = try {
+            val cfg = org.json.JSONObject(configContent ?: "{}")
+            val clashApi = cfg.optJSONObject("experimental")?.optJSONObject("clash_api")
+            val controller = clashApi?.optString("external_controller", "127.0.0.1:9090") ?: "127.0.0.1:9090"
+            val s = clashApi?.optString("secret", "") ?: ""
+            "http://$controller" to s
+        } catch (_: Exception) { "http://127.0.0.1:9090" to "" }
+        AppLog.i(TAG, "Clash API client → $baseUrl")
+        val client = ClashApiClient(baseUrl = baseUrl, secret = secret)
+        clashClient = client
+        clashHealthMonitor = ClashHealthMonitor(client, scope) { snap ->
+            trafficSnapshot.postValue(snap)
+        }.also { it.start() }
     }
 
     private fun stopHealthCheck() {
         healthCheck?.stop()
         healthCheck = null
+        clashHealthMonitor?.stop()
+        clashHealthMonitor = null
+        clashClient = null
+        trafficSnapshot.postValue(null)
         healthScope?.cancel()
         healthScope = null
     }
