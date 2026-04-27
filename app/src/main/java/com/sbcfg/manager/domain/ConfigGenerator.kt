@@ -566,10 +566,11 @@ class ConfigGenerator @Inject constructor(
         val clashApi = experimental.optJSONObject("clash_api") ?: JSONObject().also {
             experimental.put("clash_api", it)
         }
-        // Random port each start to avoid "address already in use" when a
-        // previous sing-box process hasn't released the port yet (Hysteria2
-        // QUIC shutdown can hang for 200+ seconds).
-        val port = 10000 + (System.nanoTime() % 50000).toInt().let { if (it < 0) -it else it }
+        val port = try {
+            java.net.ServerSocket(0).use { it.localPort }
+        } catch (_: Exception) {
+            10000 + (System.nanoTime() % 50000).toInt().let { if (it < 0) -it else it }
+        }
         clashApi.put("external_controller", "127.0.0.1:$port")
         // Secret disabled for now — sing-box may hang on auth header
         clashApi.remove("secret")
