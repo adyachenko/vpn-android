@@ -14,9 +14,9 @@ import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.CommandServerHandler
 import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.SystemProxyStatus
+import org.json.JSONObject
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
@@ -333,16 +333,18 @@ object BoxService : CommandServerHandler {
                 server.start()
                 AppLog.i(TAG, "CommandServer started")
 
+                val freshConfig = rotateClashApiPort(config)
+                configContent = freshConfig
+
                 // Dump config to file for debugging
                 try {
                     val debugFile = java.io.File(vpnService!!.filesDir, "debug-config.json")
-                    debugFile.writeText(config)
+                    debugFile.writeText(freshConfig)
                     AppLog.i(TAG, "Config dumped to ${debugFile.absolutePath}")
                 } catch (_: Exception) {}
-
                 AppLog.i(TAG, "Calling startOrReloadService()...")
                 val overrideOptions = OverrideOptions()
-                server.startOrReloadService(config, overrideOptions)
+                server.startOrReloadService(freshConfig, overrideOptions)
                 AppLog.i(TAG, "startOrReloadService() completed successfully")
 
                 withContext(Dispatchers.Main) {
@@ -574,6 +576,33 @@ object BoxService : CommandServerHandler {
         AppLog.e(TAG, "Health check reported VPN unhealthy — full VPN restart")
         GlobalScope.launch(Dispatchers.Main) {
             restart(ctx, config)
+        }
+    }
+
+    private fun rotateClashApiPort(config: String): String {
+        return try {
+            val json = JSONObject(config)
+            val experimental = json.optJSONObject("experimental")
+            if (experimental == null) {
+                AppLog.w(TAG, "No experimental section in config — skipping Clash API port rotation")
+                return config
+            }
+            val clashApi = experimental.optJSONObject("clash_api")
+            if (clashApi == null) {
+                AppLog.w(TAG, "No clash_api in config — skipping port rotation")
+                return config
+            }
+            val port = try {
+                java.net.ServerSocket(0).use { it.localPort }
+            } catch (_: Exception) {
+                10000 + (System.nanoTime() % 50000).toInt().let { if (it < 0) -it else it }
+            }
+            clashApi.put("external_controller", "127.0.0.1:$port")
+            AppLog.i(TAG, "Rotated Clash API port to $port")
+            json.toString()
+        } catch (e: Exception) {
+            AppLog.w(TAG, "Failed to rotate Clash API port: ${e.message}")
+            config
         }
     }
 
