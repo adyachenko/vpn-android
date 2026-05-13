@@ -134,6 +134,6 @@ class ServerSpeedRunner @Inject constructor(
         // 2 сервера ≈ 10с total — соответствует ожиданию пользователя.
         const val PING_COUNT = 3
         const val PING_TIMEOUT_SEC = 2L
-        const val DOWNLOAD_TIMEOUT_MS = 4_000L
+        const val DOWNLOAD_TIMEOUT_MS = 10_000L
     }
 }
