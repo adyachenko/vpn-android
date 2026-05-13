@@ -2,13 +2,16 @@ package com.sbcfg.manager.speedtest
 
 import com.sbcfg.manager.util.AppLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,19 +19,26 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.coroutineContext
 import kotlin.random.Random
 
 class SpeedTestEngine(private val client: OkHttpClient) {
 
     companion object {
         private const val TAG = "SpeedTest"
-        private const val PING_COUNT = 5
-        private const val DEFAULT_STREAMS = 4
-        private const val DOWNLOAD_TIMEOUT_MS = 15_000L
+        const val DEFAULT_PING_COUNT = 5
+        const val DEFAULT_PING_TIMEOUT_SEC = 5L
+        const val DEFAULT_STREAMS = 4
+        const val DEFAULT_DOWNLOAD_TIMEOUT_MS = 15_000L
         private const val UPLOAD_SIZE_BYTES = 10_000_000
         private const val BUFFER_SIZE = 8 * 1024 // 8 KB
         private const val PROGRESS_INTERVAL_MS = 500L
-        private const val PING_TIMEOUT_SEC = 5L
+    }
+
+    /** Привязать OkHttp Call к текущей корутине: при cancel — call.cancel(). */
+    private suspend fun Call.bindToCoroutine() {
+        val call = this
+        coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
     }
 
     /**
@@ -37,12 +47,16 @@ class SpeedTestEngine(private val client: OkHttpClient) {
      * Performs PING_COUNT sequential requests, then trims min/max if >= 3 results and returns
      * the mean of the remainder. Returns -1.0 on complete failure.
      */
-    suspend fun measurePing(url: String): Double = withContext(Dispatchers.IO) {
+    suspend fun measurePing(
+        url: String,
+        pingCount: Int = DEFAULT_PING_COUNT,
+        timeoutSec: Long = DEFAULT_PING_TIMEOUT_SEC,
+    ): Double = withContext(Dispatchers.IO) {
         // Derive a short-timeout client from the provided one to preserve interceptors/dispatcher
         val pingClient = client.newBuilder()
-            .connectTimeout(PING_TIMEOUT_SEC, TimeUnit.SECONDS)
-            .readTimeout(PING_TIMEOUT_SEC, TimeUnit.SECONDS)
-            .callTimeout(PING_TIMEOUT_SEC, TimeUnit.SECONDS)
+            .connectTimeout(timeoutSec, TimeUnit.SECONDS)
+            .readTimeout(timeoutSec, TimeUnit.SECONDS)
+            .callTimeout(timeoutSec, TimeUnit.SECONDS)
             .build()
 
         val request = Request.Builder()
@@ -52,10 +66,13 @@ class SpeedTestEngine(private val client: OkHttpClient) {
 
         val timings = mutableListOf<Double>()
 
-        repeat(PING_COUNT) { attempt ->
+        repeat(pingCount) { attempt ->
+            if (!isActive) return@withContext -1.0
             try {
                 val start = System.nanoTime()
-                pingClient.newCall(request).execute().use { response ->
+                val call = pingClient.newCall(request)
+                call.bindToCoroutine()
+                call.execute().use { response ->
                     val elapsed = (System.nanoTime() - start) / 1_000_000.0
                     if (response.isSuccessful || response.code in 200..399) {
                         timings.add(elapsed)
@@ -95,14 +112,15 @@ class SpeedTestEngine(private val client: OkHttpClient) {
     suspend fun measureDownload(
         url: String,
         streams: Int = DEFAULT_STREAMS,
+        timeoutMs: Long = DEFAULT_DOWNLOAD_TIMEOUT_MS,
         onProgress: (currentMbps: Double) -> Unit = {},
     ): Double = withContext(Dispatchers.IO) {
         val totalBytes = AtomicLong(0L)
         val startTime = System.nanoTime()
 
-        AppLog.i(TAG, "Starting download: $streams streams from $url")
+        AppLog.i(TAG, "Starting download: $streams streams from $url (timeout ${timeoutMs}ms)")
 
-        val result = withTimeoutOrNull(DOWNLOAD_TIMEOUT_MS) {
+        val result = withTimeoutOrNull(timeoutMs) {
             supervisorScope {
                 // Progress reporter coroutine
                 val progressJob = launch {
@@ -121,11 +139,14 @@ class SpeedTestEngine(private val client: OkHttpClient) {
                         async {
                             val request = Request.Builder().url(url).get().build()
                             try {
-                                client.newCall(request).execute().use { response ->
+                                val call = client.newCall(request)
+                                call.bindToCoroutine()
+                                call.execute().use { response ->
                                     response.body?.byteStream()?.use { stream ->
                                         val buffer = ByteArray(BUFFER_SIZE)
-                                        var read: Int
-                                        while (stream.read(buffer).also { read = it } != -1) {
+                                        var read = 0
+                                        while (isActive &&
+                                               stream.read(buffer).also { read = it } != -1) {
                                             totalBytes.addAndGet(read.toLong())
                                         }
                                     }
@@ -145,7 +166,7 @@ class SpeedTestEngine(private val client: OkHttpClient) {
         val elapsed = (System.nanoTime() - startTime) / 1_000_000_000.0
 
         if (result == null) {
-            AppLog.i(TAG, "Download timed out after ${DOWNLOAD_TIMEOUT_MS}ms — using partial result")
+            AppLog.i(TAG, "Download timed out after ${timeoutMs}ms — using partial result")
         }
 
         if (elapsed <= 0 || totalBytes.get() == 0L) {

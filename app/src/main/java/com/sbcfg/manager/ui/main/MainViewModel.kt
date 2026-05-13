@@ -5,7 +5,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.sbcfg.manager.data.preferences.AppPreferences
 import com.sbcfg.manager.domain.ConfigManager
+import com.sbcfg.manager.domain.ServerListRepository
+import com.sbcfg.manager.domain.ServerSelectionRepository
 import com.sbcfg.manager.domain.model.ConfigState
+import com.sbcfg.manager.domain.model.VpnServer
 import com.sbcfg.manager.util.AppLog
 import com.sbcfg.manager.vpn.BoxService
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -13,6 +16,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -22,14 +26,20 @@ import javax.inject.Inject
 class MainViewModel @Inject constructor(
     private val configManager: ConfigManager,
     private val appPreferences: AppPreferences,
-    private val app: Application
+    private val app: Application,
+    serverListRepository: ServerListRepository,
+    selectionRepository: ServerSelectionRepository,
 ) : ViewModel() {
 
     data class UiState(
         val configState: ConfigState = ConfigState.NotConfigured,
         val isGenerating: Boolean = false,
         val vpnRunning: Boolean = false,
-        val vpnStartedAt: Long? = null
+        val vpnStartedAt: Long? = null,
+        /** null tag = «Авто», иначе выбранный сервер (если присутствует в списке). */
+        val selectedServer: VpnServer? = null,
+        /** true если в кэше есть >1 сервера — пилюля имеет смысл показывать. */
+        val hasMultipleServers: Boolean = false,
     )
 
     private val _uiState = MutableStateFlow(UiState())
@@ -46,6 +56,19 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch {
             configManager.observeConfigState().collect { state ->
                 _uiState.update { it.copy(configState = state) }
+            }
+        }
+        viewModelScope.launch {
+            combine(
+                serverListRepository.servers,
+                selectionRepository.selectedTag,
+            ) { servers, tag ->
+                val selected = tag?.let { t -> servers.find { it.tag == t } }
+                Pair(selected, servers.size > 1)
+            }.collect { (selected, hasMany) ->
+                _uiState.update {
+                    it.copy(selectedServer = selected, hasMultipleServers = hasMany)
+                }
             }
         }
     }

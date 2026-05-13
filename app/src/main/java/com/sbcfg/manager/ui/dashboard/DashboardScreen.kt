@@ -8,6 +8,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
@@ -80,6 +81,7 @@ fun DashboardScreen(
     onOpenSettings: () -> Unit = {},
     onOpenSpeedTest: () -> Unit = {},
     onOpenConnections: () -> Unit = {},
+    onOpenServers: () -> Unit = {},
     onStartVpn: (configJson: String?) -> Unit = {},
     onStopVpn: () -> Unit = {}
 ) {
@@ -123,6 +125,13 @@ fun DashboardScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onOpenServers) {
+                        Icon(
+                            imageVector = Icons.Filled.Public,
+                            contentDescription = "Серверы",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(
                             imageVector = Icons.Filled.Settings,
@@ -154,7 +163,18 @@ fun DashboardScreen(
                 onClick = { viewModel.onToggleVpn() }
             )
 
-            Spacer(Modifier.height(40.dp))
+            Spacer(Modifier.height(16.dp))
+
+            if (state.hasMultipleServers) {
+                ServerPill(
+                    selectedServerName = state.selectedServer?.displayName,
+                    selectedCountryCode = state.selectedServer?.countryCode ?: "",
+                    onClick = onOpenServers,
+                )
+                Spacer(Modifier.height(16.dp))
+            } else {
+                Spacer(Modifier.height(24.dp))
+            }
 
             StatusBlock(
                 status = vpnStatus,
@@ -166,10 +186,24 @@ fun DashboardScreen(
 
             val configState = state.configState
             if (configState is ConfigState.Loaded) {
-                ServerInfoCard(
-                    serverName = configState.serverInfo.serverName,
-                    protocol = configState.serverInfo.protocol
-                )
+                if (state.hasMultipleServers) {
+                    // В multi-server режиме ServerInfoCard.serverName из конфига
+                    // указывает на первый outbound (hysteria2-primary) и не
+                    // отражает реальный выбор пользователя. Показываем выбранный
+                    // сервер (или «Авто» при автовыборе).
+                    val selected = state.selectedServer
+                    ServerInfoCard(
+                        serverName = selected?.displayName?.ifBlank { selected.tag }
+                            ?: "Авто (urltest)",
+                        protocol = if (selected == null) "выбор sing-box"
+                                   else configState.serverInfo.protocol,
+                    )
+                } else {
+                    ServerInfoCard(
+                        serverName = configState.serverInfo.serverName,
+                        protocol = configState.serverInfo.protocol
+                    )
+                }
             } else {
                 Text(
                     text = "Конфигурация не загружена",
@@ -572,4 +606,53 @@ private fun ServerInfoCard(
             }
         }
     }
+}
+
+@Composable
+private fun ServerPill(
+    selectedServerName: String?,
+    selectedCountryCode: String,
+    onClick: () -> Unit,
+) {
+    val isAuto = selectedServerName == null
+    val label = if (isAuto) "Авто" else selectedServerName
+    val flag = if (isAuto) "" else flagFromCountry(selectedCountryCode)
+    Surface(
+        modifier = Modifier
+            .clip(RoundedCornerShape(20.dp))
+            .clickable(onClick = onClick),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(20.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (isAuto) {
+                Icon(
+                    imageVector = Icons.Filled.Public,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+            } else {
+                Text(flag, fontSize = 16.sp)
+                Spacer(Modifier.width(6.dp))
+            }
+            Text(
+                text = label ?: "Авто",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+private fun flagFromCountry(cc: String): String {
+    if (cc.length != 2) return "🏳"
+    val up = cc.uppercase()
+    val a = Character.toChars(0x1F1E6 + (up[0].code - 'A'.code))
+    val b = Character.toChars(0x1F1E6 + (up[1].code - 'A'.code))
+    return String(a) + String(b)
 }

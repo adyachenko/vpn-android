@@ -65,6 +65,36 @@ class ClashApiClient(
         }
     }
 
+    /**
+     * Переключить активный outbound в селекторе [group] на [optionName].
+     * Стандартный Clash API: PUT /proxies/{group} body {"name": "..."}.
+     * sing-box возвращает 204 No Content при успехе.
+     */
+    fun selectOutbound(group: String, optionName: String) {
+        val url = URL("$baseUrl/proxies/$group")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.connectTimeout = 3_000
+        conn.readTimeout = 5_000
+        conn.requestMethod = "PUT"
+        conn.doOutput = true
+        conn.setRequestProperty("Content-Type", "application/json")
+        if (secret.isNotEmpty()) {
+            conn.setRequestProperty("Authorization", "Bearer $secret")
+        }
+        try {
+            val body = JSONObject().put("name", optionName).toString()
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val errBody = try { conn.errorStream?.bufferedReader()?.readText() } catch (_: Exception) { null }
+                throw IllegalStateException("HTTP $code for PUT /proxies/$group: $errBody")
+            }
+            AppLog.i(TAG, "Selector $group → $optionName (HTTP $code)")
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     fun fetchConnections(): ConnectionsSnapshot {
         val body = getRawBody("/connections")
         val root = JSONObject(body)

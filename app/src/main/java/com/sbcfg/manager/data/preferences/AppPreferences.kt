@@ -4,6 +4,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
@@ -16,6 +17,9 @@ class AppPreferences @Inject constructor(
         val AUTO_START = booleanPreferencesKey("auto_start")
         val VPN_WAS_RUNNING = booleanPreferencesKey("vpn_was_running")
         val CONFIG_URL = stringPreferencesKey("config_url")
+        val SERVERS_META_JSON = stringPreferencesKey("servers_meta_json")
+        val SERVERS_META_FETCHED_AT = longPreferencesKey("servers_meta_fetched_at")
+        val SELECTED_SERVER_TAG = stringPreferencesKey("selected_server_tag")
     }
 
     // Default: on. The reboot-resume only fires if both autoStart and
@@ -40,5 +44,35 @@ class AppPreferences @Inject constructor(
 
     suspend fun setConfigUrl(url: String) {
         dataStore.edit { it[CONFIG_URL] = url }
+    }
+
+    /**
+     * Кэшированный JSON-список VpnServer, полученный с /api/meta.
+     * Парсится / сериализуется в [com.sbcfg.manager.domain.ServerListRepository].
+     */
+    val serversMetaJson: Flow<String?> = dataStore.data.map { it[SERVERS_META_JSON] }
+
+    val serversMetaFetchedAt: Flow<Long?> = dataStore.data.map { it[SERVERS_META_FETCHED_AT] }
+
+    suspend fun setServersMeta(json: String, fetchedAt: Long) {
+        dataStore.edit {
+            it[SERVERS_META_JSON] = json
+            it[SERVERS_META_FETCHED_AT] = fetchedAt
+        }
+    }
+
+    /**
+     * Tag выбранного пользователем сервера (например "primary"). null/отсутствие
+     * = «Авто» (sing-box urltest сам выбирает). Используется
+     * [com.sbcfg.manager.domain.ServerSelectionRepository] для переключения
+     * активного outbound в `proxy-select` через Clash API.
+     */
+    val selectedServerTag: Flow<String?> = dataStore.data.map { it[SELECTED_SERVER_TAG] }
+
+    suspend fun setSelectedServerTag(tag: String?) {
+        dataStore.edit {
+            if (tag.isNullOrBlank()) it.remove(SELECTED_SERVER_TAG)
+            else it[SELECTED_SERVER_TAG] = tag
+        }
     }
 }

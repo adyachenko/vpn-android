@@ -12,6 +12,8 @@ build/
 # Tooling state
 .serena/
 .claude/
+.plans/
+.thoughts/
 
 # Local config
 local.properties
