@@ -60,9 +60,38 @@ app/src/main/java/com/sbcfg/manager/
 
 ## Сборка и установка через ADB
 
+### Установка на тестовый телефон — ВСЕГДА release APK с GitHub
+
+**Не использовать `installDebug`** на телефонах пользователя. Debug-сборка
+подписана debug-keystore (Android Studio), release APK с GitHub Actions —
+production-keystore. Подписи не совпадают → in-app обновление через
+`UpdateManager` падает с `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, и юзер
+застревает на старой версии до ручной переустановки.
+
+Правильный поток после релиза (`git tag v* && git push --tags`):
+
+```bash
+# 1. Дождаться CI (~5 мин):
+gh run watch --repo adyachenko/vpn-android
+
+# 2. Скачать release APK под ABI устройства:
+ABI=$(adb shell getprop ro.product.cpu.abi | tr -d '\r')   # arm64-v8a / armeabi-v7a
+VERSION=$(grep -E '^VERSION_' version.properties | awk -F= '{print $2}' | paste -sd. -)
+gh release download "v$VERSION" --repo adyachenko/vpn-android \
+  --pattern "*${ABI}*" --clobber --dir /tmp
+
+# 3. Установить (первый раз — uninstall если стоит debug):
+adb install -r /tmp/sing-box-config-manager-${VERSION}-${ABI}.apk
+```
+
+`installDebug` использовать только для локального дебага на эмуляторе
+или отдельном dev-устройстве, где не нужны in-app обновления.
+
+### Сборка и логи
+
 ```bash
 # Java 17 нужен, на macOS:
-JAVA_HOME="/opt/homebrew/opt/openjdk@17" ./gradlew installDebug
+JAVA_HOME="/opt/homebrew/opt/openjdk@17" ./gradlew assembleDebug
 
 # Логи приложения (тег SbcfgApp):
 adb shell logcat -c                          # очистить буфер
