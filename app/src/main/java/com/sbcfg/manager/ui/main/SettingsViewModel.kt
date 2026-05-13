@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.sbcfg.manager.BuildConfig
 import com.sbcfg.manager.data.preferences.AppPreferences
 import com.sbcfg.manager.domain.ConfigManager
+import com.sbcfg.manager.domain.ProtocolSelectionRepository
 import com.sbcfg.manager.update.UpdateInfo
 import com.sbcfg.manager.update.UpdateManager
 import com.sbcfg.manager.update.UpdateState
@@ -23,6 +24,7 @@ import javax.inject.Inject
 class SettingsViewModel @Inject constructor(
     private val configManager: ConfigManager,
     private val appPreferences: AppPreferences,
+    private val protocolSelection: ProtocolSelectionRepository,
     private val updateManager: UpdateManager,
     private val app: Application
 ) : ViewModel() {
@@ -31,6 +33,7 @@ class SettingsViewModel @Inject constructor(
         val configUrl: String? = null,
         val isRefreshing: Boolean = false,
         val autoStart: Boolean = false,
+        val selectedProtocol: String? = null,
         val message: String? = null,
         val currentVersion: String = BuildConfig.VERSION_NAME,
         val updateState: UpdateState = UpdateState.Idle
@@ -54,9 +57,20 @@ class SettingsViewModel @Inject constructor(
             }
         }
         viewModelScope.launch {
+            protocolSelection.selectedProtocol.collect { protocol ->
+                _uiState.update { it.copy(selectedProtocol = protocol) }
+            }
+        }
+        viewModelScope.launch {
             updateManager.state.collect { updateState ->
                 _uiState.update { it.copy(updateState = updateState) }
             }
+        }
+    }
+
+    fun onProtocolChanged(protocol: String?) {
+        viewModelScope.launch {
+            protocolSelection.selectProtocol(protocol)
         }
     }
 

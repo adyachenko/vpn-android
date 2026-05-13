@@ -413,10 +413,14 @@ object BoxService : CommandServerHandler {
         clashHealthMonitor = ClashHealthMonitor(client, scope) { snap ->
             trafficSnapshot.postValue(snap)
         }.also { it.start() }
-        // Применить сохранённый выбор сервера (proxy-select override) к
-        // только что поднятому Clash API. См. ServerSelectionRepository.
+        // Применить сохранённый выбор сервера (proxy-select override) и
+        // выбор протокола (per-server selector override) к только что
+        // поднятому Clash API. См. ServerSelectionRepository /
+        // ProtocolSelectionRepository.
         svc.applicationContext?.let { ctx ->
             com.sbcfg.manager.domain.ServerSelectionRepository
+                .applyAfterVpnStart(ctx, client)
+            com.sbcfg.manager.domain.ProtocolSelectionRepository
                 .applyAfterVpnStart(ctx, client)
         }
     }

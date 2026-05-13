@@ -20,6 +20,7 @@ class AppPreferences @Inject constructor(
         val SERVERS_META_JSON = stringPreferencesKey("servers_meta_json")
         val SERVERS_META_FETCHED_AT = longPreferencesKey("servers_meta_fetched_at")
         val SELECTED_SERVER_TAG = stringPreferencesKey("selected_server_tag")
+        val SELECTED_PROTOCOL = stringPreferencesKey("selected_protocol")
     }
 
     // Default: on. The reboot-resume only fires if both autoStart and
@@ -73,6 +74,22 @@ class AppPreferences @Inject constructor(
         dataStore.edit {
             if (tag.isNullOrBlank()) it.remove(SELECTED_SERVER_TAG)
             else it[SELECTED_SERVER_TAG] = tag
+        }
+    }
+
+    /**
+     * Ручной выбор протокола (override): `"hysteria2"` или `"naive"`.
+     * `null`/отсутствие = «Авто» — per-server selector держит default
+     * (`hysteria2-<tag>`). Используется
+     * [com.sbcfg.manager.domain.ProtocolSelectionRepository] для
+     * переключения per-server selector через Clash API.
+     */
+    val selectedProtocol: Flow<String?> = dataStore.data.map { it[SELECTED_PROTOCOL] }
+
+    suspend fun setSelectedProtocol(protocol: String?) {
+        dataStore.edit {
+            if (protocol.isNullOrBlank()) it.remove(SELECTED_PROTOCOL)
+            else it[SELECTED_PROTOCOL] = protocol
         }
     }
 }

@@ -25,11 +25,15 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import com.sbcfg.manager.domain.ProtocolSelectionRepository
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -268,6 +272,46 @@ fun SettingsTab(
                 }
             }
 
+            // Protocol selection (manual override)
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "Протокол VPN",
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Hysteria2 — быстрее, Naive — стабильнее на нестабильных сетях. Авто оставляет выбор серверу.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        val protocols = listOf(
+                            null to "Авто",
+                            ProtocolSelectionRepository.PROTOCOL_HYSTERIA2 to "Hysteria2",
+                            ProtocolSelectionRepository.PROTOCOL_NAIVE to "Naive"
+                        )
+                        SingleChoiceSegmentedButtonRow(
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            protocols.forEachIndexed { index, (value, label) ->
+                                SegmentedButton(
+                                    selected = state.selectedProtocol == value,
+                                    onClick = { viewModel.onProtocolChanged(value) },
+                                    shape = SegmentedButtonDefaults.itemShape(
+                                        index = index,
+                                        count = protocols.size
+                                    )
+                                ) {
+                                    Text(label)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Export config
             item {
                 Card(modifier = Modifier.fillMaxWidth()) {
@@ -432,5 +476,5 @@ fun SettingsTab(
 }
 
 // Keep in sync with LazyColumn order in SettingsTab:
-// 0 = URL, 1 = Refresh, 2 = Auto-start, 3 = Export, 4 = VPN engine, 5 = Update.
-private const val UPDATE_CARD_INDEX = 5
+// 0 = URL, 1 = Refresh, 2 = Auto-start, 3 = Protocol, 4 = Export, 5 = VPN engine, 6 = Update.
+private const val UPDATE_CARD_INDEX = 6
