@@ -70,6 +70,7 @@ object BoxService : CommandServerHandler {
     private var stopDeferred: CompletableDeferred<Unit>? = null
     private var uptimeJob: Job? = null
     private var clashHealthMonitor: ClashHealthMonitor? = null
+    private var stuckConnectionMonitor: StuckConnectionMonitor? = null
     var clashClient: ClashApiClient? = null
         private set
 
@@ -294,6 +295,7 @@ object BoxService : CommandServerHandler {
         startedAt = null
         clashClient = null
         clashHealthMonitor = null
+        stuckConnectionMonitor = null
         status.postValue(Status.Stopped)
     }
 
@@ -413,6 +415,7 @@ object BoxService : CommandServerHandler {
         clashHealthMonitor = ClashHealthMonitor(client, scope) { snap ->
             trafficSnapshot.postValue(snap)
         }.also { it.start() }
+        stuckConnectionMonitor = StuckConnectionMonitor(client, scope).also { it.start() }
         // Применить сохранённый выбор сервера (proxy-select override) и
         // выбор протокола (per-server selector override) к только что
         // поднятому Clash API. См. ServerSelectionRepository /
@@ -430,6 +433,8 @@ object BoxService : CommandServerHandler {
         healthCheck = null
         clashHealthMonitor?.stop()
         clashHealthMonitor = null
+        stuckConnectionMonitor?.stop()
+        stuckConnectionMonitor = null
         clashClient = null
         trafficSnapshot.postValue(null)
         healthScope?.cancel()
