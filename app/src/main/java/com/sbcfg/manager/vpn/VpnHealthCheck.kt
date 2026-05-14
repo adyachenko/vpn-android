@@ -109,24 +109,18 @@ class VpnHealthCheck(
         // subscriber. 1s matches sfa's dashboard and gives us sub-second
         // granularity for pattern detection without hammering the server.
         private const val STATUS_PUSH_INTERVAL_MS = 1_000L
-        // Rolling window (in StatusMessage ticks ≈ seconds) for the stall
-        // pattern. 3 ticks ≈ 3s — enough to see sustained retries from real
-        // apps (Chrome, Telegram) against a black-holed tunnel without
-        // triggering on a one-off spike.
-        private const val RX_WATCHER_WINDOW = 3
-        // Uplink threshold (bytes) over the window that signals "apps are
-        // actively trying to push data". Below this we assume idle and skip
-        // the detector — RX=0 on idle is expected, not a stall.
-        private const val RX_WATCHER_TX_THRESHOLD = 10_240L
-        // Downlink ceiling (bytes) over the window. QUIC keepalives/ACKs to
-        // Hysteria2 are tens of bytes; 512B keeps the floor above that but
-        // well below any real HTTP response payload.
-        private const val RX_WATCHER_RX_THRESHOLD = 512L
-        // Consecutive suspicious windows before we declare DEAD. Three
-        // windows = ~9s of continuous "tx without rx" — matches the typical
-        // TCP retransmit cadence, and catches the Chrome ERR_CONNECTION_*
-        // wave before the user's retry limit.
-        private const val RX_WATCHER_CONFIRM_TICKS = 3
+        // Per-tick uplink threshold (bytes) for a tick to be flagged
+        // "suspicious". Below this we treat the tick as idle (keepalives,
+        // ACKs) regardless of rx. 1KB sits above QUIC/TCP keepalive noise
+        // but well below any real request body.
+        private const val RX_WATCHER_TX_THRESHOLD = 1_024L
+        // Consecutive ticks with (dtx >= TX_THRESHOLD && drx == 0) before
+        // we declare DEAD. 5 ticks ≈ 5s of absolute downlink silence under
+        // active uplink — the signature of a black-holed tunnel (firewall
+        // dropping QUIC after wake/handover). On normal usage even a slow
+        // server replies with TCP ACKs / QUIC ACKs (single-digit bytes) so
+        // any rx > 0 within 5s resets the counter.
+        private const val RX_WATCHER_CONFIRM_TICKS = 5
         // Throttle: minimum gap between stall-triggered restarts. Same value
         // as BoxService.MIN_RESTART_INTERVAL_MS — one dead-tunnel restart
         // per minute is plenty; more than that means something else is wrong
@@ -722,25 +716,26 @@ class VpnHealthCheck(
      * cadence.
      *
      * Detects the "apps retrying into a black-holed tunnel" pattern:
-     * uplink is climbing (TCP retransmits from browsers / push clients),
-     * but downlink stays flat (no answers from the server). This is the
-     * exact symptom of the short-sleep QUIC-NAT-lie that probe() cannot
-     * catch — probe()'s own stream re-opens the NAT binding and reports
-     * "healthy" while real application sockets are dead.
+     * uplink keeps flowing (TCP retransmits from browsers / push clients),
+     * but downlink is absolute zero. This is the exact symptom of the
+     * short-sleep QUIC-NAT-lie that probe() cannot catch — probe()'s own
+     * stream re-opens the NAT binding and reports "healthy" while real
+     * application sockets are dead.
      *
-     * Trigger conditions (RX_WATCHER_CONFIRM_TICKS consecutive windows):
-     *   sum(dtx over window) > RX_WATCHER_TX_THRESHOLD  (10 KB)
-     *   sum(drx over window) < RX_WATCHER_RX_THRESHOLD  (512 B)
+     * Trigger condition (RX_WATCHER_CONFIRM_TICKS consecutive ticks):
+     *   dtx >= RX_WATCHER_TX_THRESHOLD  AND  drx == 0
      *
-     * Downlink threshold sits above QUIC keepalive/ACK noise but well
-     * below any real HTTP response, so idle periods (no tx either) don't
-     * false-positive.
+     * Per-tick (not windowed): a sliding-window sum allowed false positives
+     * during active video traffic (Instagram scrolling, etc.) where a real
+     * pause of 1-2s between payloads bracketed by 1-2 small-rx ticks could
+     * push the sum below the floor. With drx == 0 as the bad-tick criterion,
+     * any reply (even a TCP ACK or QUIC ACK, typically tens of bytes) resets
+     * the counter — only a truly black-holed downlink survives 5s straight.
      */
     private inner class TunnelStallDetector : CommandClientHandler {
         private var prevUpTotal = -1L
         private var prevDownTotal = -1L
-        private val window = ArrayDeque<Pair<Long, Long>>()
-        private var consecutiveSuspicious = 0
+        private var consecutiveBad = 0
         private var lastTickAtMs = 0L
         private var lastLoggedState: HealthMetrics.StallState? = null
         private var logCounter = 0
@@ -750,7 +745,7 @@ class VpnHealthCheck(
             val now = System.currentTimeMillis()
             // Drop burst pushes (engine shutdown drain, etc.). Real pushes
             // come at STATUS_PUSH_INTERVAL_MS; anything closer is libbox
-            // flushing its buffer and would stack our window into a fake
+            // flushing its buffer and would stack our counter into a fake
             // DEAD within milliseconds.
             if (lastTickAtMs > 0L && now - lastTickAtMs < STATUS_MIN_GAP_MS) return
             lastTickAtMs = now
@@ -768,29 +763,22 @@ class VpnHealthCheck(
 
             // coerceAtLeast(0) guards against libbox's counters resetting
             // on an internal reload, which would otherwise produce a giant
-            // negative delta and break the window sums.
+            // negative delta and corrupt the bad-tick check.
             val dtx = (upTotal - prevUpTotal).coerceAtLeast(0L)
             val drx = (downTotal - prevDownTotal).coerceAtLeast(0L)
             prevUpTotal = upTotal
             prevDownTotal = downTotal
 
-            window.addLast(dtx to drx)
-            while (window.size > RX_WATCHER_WINDOW) window.removeFirst()
-
-            val sumTx = window.sumOf { it.first }
-            val sumRx = window.sumOf { it.second }
-            val windowFull = window.size >= RX_WATCHER_WINDOW
-            val isSuspicious =
-                windowFull && sumTx > RX_WATCHER_TX_THRESHOLD && sumRx < RX_WATCHER_RX_THRESHOLD
-            consecutiveSuspicious = if (isSuspicious) consecutiveSuspicious + 1 else 0
+            val isBad = dtx >= RX_WATCHER_TX_THRESHOLD && drx == 0L
+            consecutiveBad = if (isBad) consecutiveBad + 1 else 0
 
             val state = when {
-                consecutiveSuspicious >= RX_WATCHER_CONFIRM_TICKS -> HealthMetrics.StallState.DEAD
-                isSuspicious -> HealthMetrics.StallState.SUSPICIOUS
+                consecutiveBad >= RX_WATCHER_CONFIRM_TICKS -> HealthMetrics.StallState.DEAD
+                isBad -> HealthMetrics.StallState.SUSPICIOUS
                 else -> HealthMetrics.StallState.HEALTHY
             }
 
-            publish(status, state, consecutiveSuspicious)
+            publish(status, state, consecutiveBad)
 
             // Log sparingly: always on state change (that's the signal
             // we care about), otherwise one line per RX_WATCHER_LOG_EVERY
@@ -803,15 +791,13 @@ class VpnHealthCheck(
                 AppLog.i(
                     TAG,
                     "rx-watcher: dtx=${dtx}B drx=${drx}B " +
-                            "sumTx=${sumTx}B sumRx=${sumRx}B " +
                             "up=${status.uplink}Bps down=${status.downlink}Bps " +
-                            "state=$state susp=$consecutiveSuspicious",
+                            "state=$state bad=$consecutiveBad",
                 )
                 lastLoggedState = state
             }
 
             if (state == HealthMetrics.StallState.DEAD) {
-                val now = System.currentTimeMillis()
                 if (now - lastStallRestartAt < MIN_STALL_RESTART_INTERVAL_MS) {
                     return
                 }
@@ -820,10 +806,10 @@ class VpnHealthCheck(
                 AppLog.e(
                     TAG,
                     "rx-watcher DETECT: tunnel stalled " +
-                            "(tx=${sumTx}B, rx=${sumRx}B over ${window.size} ticks) — force restarting",
+                            "($consecutiveBad consecutive ticks with rx=0 and dtx>=${RX_WATCHER_TX_THRESHOLD}B) " +
+                            "— force restarting",
                 )
-                window.clear()
-                consecutiveSuspicious = 0
+                consecutiveBad = 0
                 runCatching { onConnectivityLost(true) }
                     .onFailure { AppLog.e(TAG, "rx-watcher onConnectivityLost failed", it) }
             }
