@@ -4,6 +4,7 @@ import com.sbcfg.manager.util.AppLog
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 
 private const val TAG = "ClashApiClient"
 
@@ -95,6 +96,51 @@ class ClashApiClient(
         }
     }
 
+    /**
+     * Синхронно прогоняет HTTP-проверку через указанный outbound (Clash-API delay-test).
+     * Endpoint: `GET /proxies/{name}/delay?url=...&timeout=...`. sing-box физически
+     * устанавливает соединение к outbound'у и делает GET по [url]. Это используется
+     * как «прогрев» outbound'а перед переключением на него selector'а — гарантирует,
+     * что h2/QUIC-сессия уже поднята до того как туда пойдёт реальный трафик.
+     *
+     * @param timeoutMs таймаут проверки на стороне sing-box (мс). HTTP read-timeout
+     *   локального соединения с Clash API выставляется на [timeoutMs] + 2000, чтобы
+     *   гарантированно дождаться ответа sing-box'а.
+     * @return delay в мс при успехе.
+     * @throws IllegalStateException при HTTP-ошибке или если outbound не ответил.
+     */
+    fun proxyDelay(
+        name: String,
+        url: String = DEFAULT_DELAY_URL,
+        timeoutMs: Int = DEFAULT_DELAY_TIMEOUT_MS,
+    ): Long {
+        val encodedUrl = URLEncoder.encode(url, "UTF-8")
+        val encodedName = URLEncoder.encode(name, "UTF-8")
+        val path = "/proxies/$encodedName/delay?url=$encodedUrl&timeout=$timeoutMs"
+        val conn = URL("$baseUrl$path").openConnection() as HttpURLConnection
+        conn.connectTimeout = 3_000
+        conn.readTimeout = timeoutMs + 2_000
+        conn.setRequestProperty("Accept", "application/json")
+        if (secret.isNotEmpty()) {
+            conn.setRequestProperty("Authorization", "Bearer $secret")
+        }
+        try {
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val body = stream?.bufferedReader()?.readText().orEmpty()
+            if (code !in 200..299) {
+                throw IllegalStateException("HTTP $code for $path: $body")
+            }
+            val delay = JSONObject(body).optLong("delay", -1L)
+            if (delay < 0) {
+                throw IllegalStateException("delay test for $name returned no delay: $body")
+            }
+            return delay
+        } finally {
+            conn.disconnect()
+        }
+    }
+
     fun fetchConnections(): ConnectionsSnapshot {
         val body = getRawBody("/connections")
         val root = JSONObject(body)
@@ -180,4 +226,9 @@ class ClashApiClient(
         var download: Long = 0L,
         var connectionCount: Int = 0,
     )
+
+    companion object {
+        const val DEFAULT_DELAY_URL = "https://www.google.com/generate_204"
+        const val DEFAULT_DELAY_TIMEOUT_MS = 3_000
+    }
 }

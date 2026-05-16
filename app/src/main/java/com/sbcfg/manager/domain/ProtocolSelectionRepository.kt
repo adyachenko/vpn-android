@@ -15,6 +15,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -64,10 +65,31 @@ class ProtocolSelectionRepository @Inject constructor(
                 PROTOCOL_NAIVE -> "naive-$tag"
                 else -> "hysteria2-$tag"
             }
+            // Прогреваем target перед переключением селектора, чтобы избежать race
+            // condition: сразу после startOrReloadService selector держит default
+            // (`hysteria2-<tag>`), а ровно следующим действием мы переключаем его на
+            // naive с interrupt_exist_connections=true. Если в этот момент h2-сессия
+            // naive ещё не установилась, sing-box оставляет «зомби»-стримы в пуле,
+            // и каждый CONNECT через них рубится мгновенно (сервер видит status=500
+            // forwardproxy.go:325 `http2: stream closed` на flush). Delay-test
+            // физически поднимает h2/TLS до switch'а — после warmup'а selectOutbound
+            // не нарывается на холодный outbound. См. wiki §13 v1.3.5.
+            warmupOutbound(client, target)
             try {
                 client.selectOutbound(group, target)
             } catch (e: Exception) {
                 AppLog.w(TAG, "Failed to apply $group → $target: ${e.message}")
+            }
+        }
+    }
+
+    private suspend fun warmupOutbound(client: ClashApiClient, outbound: String) {
+        withContext(Dispatchers.IO) {
+            try {
+                val delay = client.proxyDelay(outbound)
+                AppLog.i(TAG, "Warmed up $outbound: ${delay}ms")
+            } catch (e: Exception) {
+                AppLog.w(TAG, "Warmup of $outbound failed: ${e.message} — switching anyway")
             }
         }
     }
