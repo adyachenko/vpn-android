@@ -177,8 +177,13 @@ class VpnHealthCheck(
         // Max connection lifetime to count as "failed". Longer-lived idle
         // connections that close with 0 downlink are not failures.
         private const val CONN_FAIL_MAX_LIFETIME_MS = 120_000L
-        // Only count connections through these outbounds.
-        private val PROXY_OUTBOUNDS = setOf("hysteria2-out", "naive-out")
+        // Match any proxy outbound. Multi-server config uses tags like
+        // `hysteria2-de`, `naive-primary` — the old single-server topology
+        // had just `hysteria2-out`/`naive-out`. Prefix check covers both.
+        // Without this fix, ConnectionFailureDetector silently filters out
+        // every TCP event in multi-server topology and never fires a restart.
+        private fun isProxyOutbound(name: String?): Boolean =
+            name != null && (name.startsWith("hysteria2-") || name.startsWith("naive-"))
     }
 
     private var job: Job? = null
@@ -872,7 +877,7 @@ class VpnHealthCheck(
                 if (event.type.toInt() != 2) continue // ConnectionEventClosed
                 val conn = event.connection ?: continue
                 if (conn.network != "tcp") continue
-                if (conn.outbound !in PROXY_OUTBOUNDS) continue
+                if (!isProxyOutbound(conn.outbound)) continue
 
                 val lifetimeMs = event.closedAt - conn.createdAt
                 val failed = conn.downlinkTotal == 0L && lifetimeMs in 1 until CONN_FAIL_MAX_LIFETIME_MS
