@@ -521,6 +521,34 @@ object BoxService : CommandServerHandler {
     }
 
     /**
+     * Called by VPNService when ACTION_DEVICE_IDLE_MODE_CHANGED fires (entering
+     * or exiting Android Doze). Drives cooperative pause/wake via libbox's
+     * PauseManager — sing-box itself tears down outbound pools (h2 for naive,
+     * QUIC for hysteria) on pause and rebuilds them on wake. Replaces the
+     * previous full-VPN-restart-on-long-sleep approach (which had its own race
+     * conditions; see wiki §13 v1.3.5/v1.3.6). Safety net: if pause/wake
+     * doesn't fully recover, ConnectionFailureDetector and rx-watcher still
+     * catch degraded outbounds and trigger a full restart as a last resort.
+     */
+    internal fun onDeviceIdleModeChanged() {
+        if (status.value != Status.Started) return
+        val server = commandServer ?: return
+        val pm = service?.applicationContext?.getSystemService(android.os.PowerManager::class.java)
+        val idle = pm?.isDeviceIdleMode == true
+        try {
+            if (idle) {
+                AppLog.i(TAG, "Entering Doze — commandServer.pause()")
+                server.pause()
+            } else {
+                AppLog.i(TAG, "Exiting Doze — commandServer.wake()")
+                server.wake()
+            }
+        } catch (e: Exception) {
+            AppLog.w(TAG, "pause/wake failed (idle=$idle): ${e.message}")
+        }
+    }
+
+    /**
      * Called when the tunnel connectivity probe (real HTTP request through
      * the VPN network) fails repeatedly. Does a full VPN restart because a
      * dead Hysteria2 UDP outbound is only recoverable by rebinding sockets.

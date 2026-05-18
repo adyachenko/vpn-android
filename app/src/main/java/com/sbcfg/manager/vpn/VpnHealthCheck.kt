@@ -85,16 +85,10 @@ class VpnHealthCheck(
         private const val PROXY_AUTO_TAG = "proxy-auto"
         private const val HYSTERIA_TAG = "hysteria2-out"
         private const val NETWORK_CHANGE_CHECK_DELAY_MS = 10_000L
-        // After a screen-off, apps' TCP connections die and Hysteria2's QUIC
-        // session outlives its NAT binding on the path (home router / carrier
-        // CGNAT). A probe can wrongly report the tunnel healthy (the probe
-        // stream re-opens the NAT binding), while real traffic fails with
-        // ERR_CONNECTION_RESET. Only a full VPN restart rebinds sockets and
-        // tears down the stale QUIC session. 15s covers mobile CGNAT / Doze,
-        // which rip TCP sockets well before the typical 30–60s UDP timeout.
-        // Shorter risks unnecessary restarts on quick screen-peek patterns.
-        private const val WAKE_RESET_THRESHOLD_MS = 15_000L
-        private const val WAKE_RESTART_COOLDOWN_MS = 120_000L
+        // Doze recovery is handled by libbox's PauseManager via
+        // BoxService.onDeviceIdleModeChanged (see wiki §13 v1.3.7).
+        // No long-sleep restart constant is needed here — wake-restart was
+        // removed in v1.3.7 in favor of cooperative pause/wake.
 
         // --- Screen-off battery optimization ---
         // Probe interval when screen is off — no user is looking, so slow
@@ -379,9 +373,10 @@ class VpnHealthCheck(
     }
 
     /**
-     * Called on screen-off. We record the timestamp so onWakeFromSleep can
-     * decide whether the screen was off long enough for the QUIC NAT binding
-     * to matter (WAKE_RESET_THRESHOLD_MS).
+     * Called on screen-off. Records the timestamp (for diagnostics — the
+     * actual Doze entry is signalled separately via DEVICE_IDLE_MODE_CHANGED,
+     * see [BoxService.onDeviceIdleModeChanged]) and pauses persistent
+     * detectors after a debounce to save battery during long screen-off.
      */
     fun onScreenOff() {
         lastScreenOffAt = System.currentTimeMillis()
@@ -396,20 +391,18 @@ class VpnHealthCheck(
     }
 
     /**
-     * Called on screen-on. Two-branch policy:
+     * Called on screen-on. Force-runs the probe loop one cycle so problems
+     * (dead libbox / dead outbound) are caught the moment the user looks at
+     * the screen, instead of waiting up to CHECK_INTERVAL_MS for the next
+     * tick. Feeds the same failure counters as the main loop.
      *
-     * - Short sleep (< WAKE_RESET_THRESHOLD_MS): force an immediate probe.
-     *   Catches a broken tunnel the moment the user looks at the phone,
-     *   instead of waiting up to CHECK_INTERVAL_MS for the next tick. Feeds
-     *   the same failure counter as the main loop, so a failure flips the
-     *   loop into RETRY_INTERVAL_MS cadence.
-     *
-     * - Long sleep (>= WAKE_RESET_THRESHOLD_MS): full VPN restart, skipping
-     *   the probe entirely. After ~minute of silence the Hysteria2 QUIC
-     *   session has outlived its NAT binding on the path, and apps' TCP
-     *   connections have all died. A probe would wrongly report healthy
-     *   (its own stream re-opens the binding) while real traffic fails —
-     *   only a full stop→start rebinds sockets and tears down stale QUIC.
+     * Long-sleep restart was removed in v1.3.7. After Doze, outbound pool
+     * teardown/rebuild is now driven by [BoxService.onDeviceIdleModeChanged]
+     * via libbox's PauseManager — cooperative pause/wake of all outbounds
+     * inside the Go engine, without race conditions from recreating the
+     * whole libbox instance. If pause/wake doesn't fully recover, the
+     * existing safety nets (ConnectionFailureDetector, rx-watcher, probe
+     * failures) still trigger a full restart as a last resort.
      */
     fun onWakeFromSleep(scope: CoroutineScope) {
         screenOn = true
@@ -430,21 +423,6 @@ class VpnHealthCheck(
 
         networkCheckJob?.cancel()
         networkCheckJob = scope.launch(Dispatchers.IO) {
-            if (sleepMs >= WAKE_RESET_THRESHOLD_MS) {
-                val sinceLastRestart = System.currentTimeMillis() - lastRestartRequestAt
-                if (lastRestartRequestAt > 0 && sinceLastRestart < WAKE_RESTART_COOLDOWN_MS) {
-                    AppLog.i(TAG, "Screen on after ${sleepMs}ms — skipping restart, detector restarted ${sinceLastRestart / 1000}s ago")
-                    handleProbeResult(probe())
-                    wakeSignal?.complete(Unit)
-                    return@launch
-                }
-                AppLog.i(TAG, "Screen on after ${sleepMs}ms — restarting VPN to drop stale QUIC/TCP")
-                tunnelFailures = 0
-                lastRestartRequestAt = System.currentTimeMillis()
-                runCatching { onConnectivityLost(false) }
-                    .onFailure { AppLog.e(TAG, "onConnectivityLost callback failed", it) }
-                return@launch
-            }
             AppLog.i(TAG, "Screen on after ${sleepMs}ms — forcing health check")
             handleProbeResult(probe())
             // Wake the main loop so the next tick lands at the adaptive

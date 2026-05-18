@@ -32,14 +32,26 @@ class VPNService : VpnService(), PlatformInterface {
     private var tunFd: ParcelFileDescriptor? = null
     private var defaultNetworkMonitor: DefaultNetworkMonitor? = null
     private var screenReceiver: BroadcastReceiver? = null
+    private var idleModeReceiver: BroadcastReceiver? = null
 
     override fun onCreate() {
         super.onCreate()
-        // Hysteria2 UDP dies after Doze strands the NAT binding (typically
-        // ~60s of radio silence). No network-change callback fires on unlock
-        // if wifi stayed the same, so we piggyback on ACTION_SCREEN_ON to
-        // trigger a urltest refresh and, if the tunnel is actually dead, a
-        // restart. SCREEN_ON is a protected system broadcast.
+        // Two independent system signals drive lifecycle of outbound pools:
+        //
+        // 1) ACTION_SCREEN_ON/OFF — frequent (every peek). We use it for
+        //    out-of-band probe and battery savings (pause health-check
+        //    detectors when screen is off). NO restart is triggered from
+        //    screen-on alone since v1.3.7 — long-sleep restart was replaced
+        //    by cooperative pause/wake via PauseManager (see signal #2).
+        //
+        // 2) ACTION_DEVICE_IDLE_MODE_CHANGED — fires only when Android
+        //    enters/exits real Doze (minutes of stillness + screen off).
+        //    We call commandServer.pause()/wake() — sing-box's PauseManager
+        //    cleanly tears down outbound pools (h2 for naive, QUIC for
+        //    hysteria) on pause and recreates them on wake. This is the
+        //    intended upstream mechanism for Doze recovery and replaces
+        //    our previous full-VPN-restart approach (which had its own
+        //    race conditions, see wiki §13 v1.3.5/v1.3.6).
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
@@ -55,6 +67,18 @@ class VPNService : VpnService(), PlatformInterface {
         ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         screenReceiver = receiver
         AppLog.i(TAG, "Screen receiver registered (on+off)")
+
+        val idleReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == android.os.PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) {
+                    BoxService.onDeviceIdleModeChanged()
+                }
+            }
+        }
+        val idleFilter = IntentFilter(android.os.PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+        ContextCompat.registerReceiver(this, idleReceiver, idleFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        idleModeReceiver = idleReceiver
+        AppLog.i(TAG, "Idle mode receiver registered (DEVICE_IDLE_MODE_CHANGED)")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -97,6 +121,12 @@ class VPNService : VpnService(), PlatformInterface {
             AppLog.w(TAG, "Error unregistering screen receiver: ${e.message}")
         }
         screenReceiver = null
+        try {
+            idleModeReceiver?.let { unregisterReceiver(it) }
+        } catch (e: Exception) {
+            AppLog.w(TAG, "Error unregistering idle-mode receiver: ${e.message}")
+        }
+        idleModeReceiver = null
         closeTun()
         BoxService.onServiceDestroy()
         super.onDestroy()
