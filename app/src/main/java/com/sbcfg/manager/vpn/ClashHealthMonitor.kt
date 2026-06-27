@@ -23,14 +23,29 @@ class ClashHealthMonitor(
     private var lastUpload: Long = 0L
     private var staleCount: Int = 0
 
+    @Volatile
+    private var active: Boolean = true
+
     fun start() {
         job = scope.launch {
             delay(INITIAL_DELAY_MS)
             while (isActive) {
-                check()
+                if (active) {
+                    check()
+                }
                 delay(CHECK_INTERVAL_MS)
             }
         }
+    }
+
+    fun pause() {
+        active = false
+        AppLog.i(TAG, "paused")
+    }
+
+    fun resume() {
+        active = true
+        AppLog.i(TAG, "resumed")
     }
 
     private suspend fun check() {

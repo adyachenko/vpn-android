@@ -72,19 +72,34 @@ class StuckConnectionMonitor(
     @Volatile
     private var lastStuckSignature: String = ""
 
+    @Volatile
+    private var active: Boolean = true
+
     fun start() {
         stop()
         job = scope.launch(Dispatchers.IO) {
             delay(INITIAL_DELAY_MS)
             while (isActive) {
-                try {
-                    pollOnce()
-                } catch (e: Exception) {
-                    AppLog.w(TAG, "poll failed: ${e.message}")
+                if (active) {
+                    try {
+                        pollOnce()
+                    } catch (e: Exception) {
+                        AppLog.w(TAG, "poll failed: ${e.message}")
+                    }
                 }
                 delay(POLL_INTERVAL_MS)
             }
         }
+    }
+
+    fun pause() {
+        active = false
+        AppLog.i(TAG, "paused")
+    }
+
+    fun resume() {
+        active = true
+        AppLog.i(TAG, "resumed")
     }
 
     fun stop() {

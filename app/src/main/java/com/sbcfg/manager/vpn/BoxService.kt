@@ -1,3 +1,5 @@
+@file:OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+
 package com.sbcfg.manager.vpn
 
 import android.annotation.SuppressLint
@@ -6,7 +8,10 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.os.IBinder
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.ProcessLifecycleOwner
 import com.sbcfg.manager.constant.Alert
 import com.sbcfg.manager.constant.Status
 import com.sbcfg.manager.util.AppLog
@@ -75,6 +80,8 @@ object BoxService : CommandServerHandler {
         private set
 
     val trafficSnapshot = MutableLiveData<TrafficSnapshot?>(null)
+
+    private var lifecycleObserver: LifecycleEventObserver? = null
 
     @Volatile
     private var lastConnectivityRestart: Long = 0
@@ -416,6 +423,25 @@ object BoxService : CommandServerHandler {
             trafficSnapshot.postValue(snap)
         }.also { it.start() }
         stuckConnectionMonitor = StuckConnectionMonitor(client, scope).also { it.start() }
+
+        // Паузить ClashHealthMonitor и StuckConnectionMonitor когда приложение
+        // в background — их данные нужны только когда пользователь видит UI.
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> {
+                    clashHealthMonitor?.resume()
+                    stuckConnectionMonitor?.resume()
+                }
+                Lifecycle.Event.ON_STOP -> {
+                    clashHealthMonitor?.pause()
+                    stuckConnectionMonitor?.pause()
+                }
+                else -> {}
+            }
+        }
+        ProcessLifecycleOwner.get().lifecycle.addObserver(observer)
+        lifecycleObserver = observer
+
         // Применить сохранённый выбор сервера (proxy-select override) и
         // выбор протокола (per-server selector override) к только что
         // поднятому Clash API. См. ServerSelectionRepository /
@@ -435,6 +461,8 @@ object BoxService : CommandServerHandler {
         clashHealthMonitor = null
         stuckConnectionMonitor?.stop()
         stuckConnectionMonitor = null
+        lifecycleObserver?.let { ProcessLifecycleOwner.get().lifecycle.removeObserver(it) }
+        lifecycleObserver = null
         clashClient = null
         trafficSnapshot.postValue(null)
         healthScope?.cancel()
