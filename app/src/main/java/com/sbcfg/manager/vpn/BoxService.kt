@@ -536,15 +536,20 @@ object BoxService : CommandServerHandler {
     internal fun onScreenOn() {
         if (status.value != Status.Started) return
         val scope = healthScope ?: return
+        clashHealthMonitor?.resume()
+        stuckConnectionMonitor?.resume()
         healthCheck?.onWakeFromSleep(scope)
     }
 
     /**
-     * Called by VPNService when ACTION_SCREEN_OFF fires. Just records the
-     * timestamp so the screen-on handler can gate on sleep duration.
+     * Called by VPNService when ACTION_SCREEN_OFF fires. Pauses UI-facing
+     * monitors (ClashHealth, StuckConn) and delegates to VpnHealthCheck
+     * which stops its detectors and slows the probe loop to 120s.
      */
     internal fun onScreenOff() {
         if (status.value != Status.Started) return
+        clashHealthMonitor?.pause()
+        stuckConnectionMonitor?.pause()
         healthCheck?.onScreenOff()
     }
 
