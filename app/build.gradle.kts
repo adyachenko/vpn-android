@@ -20,7 +20,7 @@ android {
 
     defaultConfig {
         applicationId = "com.sbcfg.manager"
-        minSdk = 28
+        minSdk = 26
         targetSdk = 35
         versionCode = vMajor * 10000 + vMinor * 100 + vPatch
         versionName = "$vMajor.$vMinor.$vPatch"

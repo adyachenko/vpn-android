@@ -59,7 +59,8 @@
             android:name=".vpn.VPNService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice"
-            android:permission="android.permission.BIND_VPN_SERVICE">
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            tools:targetApi="34">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
