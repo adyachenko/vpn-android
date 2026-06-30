@@ -13,6 +13,7 @@ import com.sbcfg.manager.domain.model.AppMode
 import com.sbcfg.manager.domain.model.ConfigState
 import com.sbcfg.manager.domain.model.DomainMode
 import com.sbcfg.manager.domain.model.ServerInfo
+import com.sbcfg.manager.util.AppLog
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -82,8 +83,19 @@ class ConfigManager @Inject constructor(
     }
 
     suspend fun refreshConfig(): Result<ServerInfo> {
-        val url = appPreferences.configUrl.first()
-            ?: return Result.failure(IllegalStateException("URL конфига не найден"))
+        var url = appPreferences.configUrl.first()
+        if (url == null) {
+            // DataStore мог потерять URL из-за коррупции preferences_pb.
+            val roomUrl = serverConfigDao.get()?.url
+            if (roomUrl != null) {
+                AppLog.i(TAG, "Config URL missing in DataStore, recovered from Room")
+                appPreferences.setConfigUrl(roomUrl)
+                url = roomUrl
+            }
+        }
+        if (url == null) {
+            return Result.failure(IllegalStateException("URL конфига не найден"))
+        }
 
         return try {
             val jsonString = apiClient.fetchConfig(url).getOrThrow()
@@ -259,5 +271,9 @@ class ConfigManager @Inject constructor(
             }
             break
         }
+    }
+
+    companion object {
+        private const val TAG = "ConfigManager"
     }
 }

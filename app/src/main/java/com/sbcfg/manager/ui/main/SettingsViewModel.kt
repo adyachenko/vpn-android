@@ -7,6 +7,7 @@ import com.sbcfg.manager.BuildConfig
 import com.sbcfg.manager.data.preferences.AppPreferences
 import com.sbcfg.manager.domain.ConfigManager
 import com.sbcfg.manager.domain.ProtocolSelectionRepository
+import com.sbcfg.manager.domain.model.ConfigState
 import com.sbcfg.manager.update.UpdateInfo
 import com.sbcfg.manager.update.UpdateManager
 import com.sbcfg.manager.update.UpdateState
@@ -15,6 +16,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -47,8 +49,15 @@ class SettingsViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
-            appPreferences.configUrl.collect { url ->
-                _uiState.update { it.copy(configUrl = url) }
+            // URL из DataStore (основной), с fallback на URL из Room на случай
+            // если DataStore потерял данные (коррупция preferences_pb).
+            combine(
+                appPreferences.configUrl,
+                configManager.observeConfigState(),
+            ) { url, configState ->
+                url ?: (configState as? ConfigState.Loaded)?.serverInfo?.url
+            }.collect { effectiveUrl ->
+                _uiState.update { it.copy(configUrl = effectiveUrl) }
             }
         }
         viewModelScope.launch {

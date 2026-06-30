@@ -1,5 +1,6 @@
 package com.sbcfg.manager.domain
 
+import com.sbcfg.manager.data.local.dao.ServerConfigDao
 import com.sbcfg.manager.data.preferences.AppPreferences
 import com.sbcfg.manager.data.remote.ConfigApiClient
 import com.sbcfg.manager.domain.model.VpnServer
@@ -24,6 +25,7 @@ import javax.inject.Singleton
 class ServerListRepository @Inject constructor(
     private val apiClient: ConfigApiClient,
     private val appPreferences: AppPreferences,
+    private val serverConfigDao: ServerConfigDao,
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -48,8 +50,20 @@ class ServerListRepository @Inject constructor(
 
     /** Принудительный refresh — для pull-to-refresh / при изменении конфига. */
     suspend fun refresh(): Result<List<VpnServer>> {
-        val configUrl = appPreferences.configUrl.first()
-            ?: return Result.failure(IllegalStateException("URL конфига не задан"))
+        var configUrl = appPreferences.configUrl.first()
+        if (configUrl == null) {
+            // DataStore мог потерять URL из-за коррупции preferences_pb.
+            // Пробуем восстановить из Room (там хранится оригинальный конфиг).
+            val roomUrl = serverConfigDao.get()?.url
+            if (roomUrl != null) {
+                AppLog.i(TAG, "Config URL missing in DataStore, recovered from Room")
+                appPreferences.setConfigUrl(roomUrl)
+                configUrl = roomUrl
+            }
+        }
+        if (configUrl == null) {
+            return Result.failure(IllegalStateException("URL конфига не задан"))
+        }
         AppLog.i(TAG, "Fetching servers meta...")
         val result = apiClient.fetchMeta(configUrl)
         result.onSuccess { servers ->
